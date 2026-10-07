@@ -177,6 +177,7 @@ enum Reconcile {
                 let matches = names.filter { $0.value == title && place.title.contains(" | ") }
                 if matches.isEmpty {
                     guard let activity = claudeActivity(place.title) else { continue }
+                    guard !unplaced.contains(where: { $0.agent == "claude" }) else { continue }
                     let name = String(place.title.dropFirst(2))
                     rows[id] = SessionStatus(agent: "claude", sessionId: id, state: activity,
                         title: name.isEmpty ? "Claude Code" : name, cwd: place.cwd, repo: nil, branch: nil, color: nil,
