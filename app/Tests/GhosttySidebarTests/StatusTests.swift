@@ -26,6 +26,11 @@ final class StatusTests {
         tests.testClosedTerminalDoesNotLeaveGhostRow()
         tests.testMissingCodexHookRecoveredFromSession()
         tests.testTerminalWithoutAgentIsHidden()
+        tests.testClaudeTabWithoutRecordIsShownFromTitle()
+        tests.testUnplacedClaudeRecordPreventsConflictingFallback()
+        tests.testAmbiguousClaudeTabsKeepUnplacedRecords()
+        tests.testOtherRecordsDoNotBlockClaudeFallback()
+        tests.testExpiredUnplacedRecordDoesNotBlockClaudeFallback()
         tests.testAmbiguousCodexNamesAreNotAssigned()
         tests.testFractionalTimestampsAndDoneGrace()
         tests.testCodexSpinnerDoesNotBecomePartOfIdentity()
@@ -35,7 +40,7 @@ final class StatusTests {
         tests.testTwoTabsWithSameTitleAreAmbiguous()
         tests.testSubsecondTranscriptCannotOverridePermissionHook()
         try tests.testPartialTranscriptLineDoesNotDiscardLastCompleteEvent()
-        print("18 status tests passed")
+        print("23 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -103,6 +108,52 @@ final class StatusTests {
         XCTAssertTrue(rows([], layout("zsh")).isEmpty)
         XCTAssertTrue(rows([], layout("Task | repo"), names: ["S": "Other"]).isEmpty)
     }
+    func testClaudeTabWithoutRecordIsShownFromTitle() {
+        let working = rows([], layout("◑ Task"))
+        XCTAssertEqual(working.count, 1)
+        XCTAssertEqual(working.first?.agent, "claude")
+        XCTAssertEqual(working.first?.state, "working")
+        XCTAssertEqual(working.first?.title, "Task")
+        XCTAssertEqual(working.first?.ghosttyTerminalId, "T")
+        XCTAssertEqual(rows([], layout("✳ Task")).first?.state, "idle")
+    }
+    func testUnplacedClaudeRecordPreventsConflictingFallback() {
+        for title in ["✳ Task", "◑ Task"] {
+            let waiting = record("waiting", terminal: nil)
+            XCTAssertEqual(rows([waiting], layout(title)), [waiting])
+        }
+    }
+    func testAmbiguousClaudeTabsKeepUnplacedRecords() {
+        let waiting = record("waiting", terminal: nil)
+        var other = record("working", terminal: nil)
+        other.sessionId = "other"
+        other.cwd = "/other"
+        var live = layout("✳ Task")
+        live.places["T2"] = TerminalPlace(windowId: "W", tabIndex: 2, splitIndex: 1, title: "◑ Task", cwd: "/other")
+        let result = rows([waiting, other], live)
+        XCTAssertEqual(Set(result.map(\.id)), Set([waiting.id, other.id]))
+        XCTAssertEqual(result.count, 2)
+        XCTAssertTrue(result.allSatisfy { $0.ghosttyTerminalId == nil })
+        XCTAssertEqual(result.first { $0.id == waiting.id }?.state, "waiting")
+    }
+    func testOtherRecordsDoNotBlockClaudeFallback() {
+        var live = layout("◑ Task")
+        live.places["T2"] = TerminalPlace(windowId: "W", tabIndex: 2, splitIndex: 1, title: "✳ Other")
+        let placed = record("waiting", terminal: "T2")
+        var codex = record("waiting", terminal: nil)
+        codex.agent = "codex"
+        let result = rows([placed, codex], live)
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result.first { $0.ghosttyTerminalId == "T" }?.state, "working")
+        XCTAssertEqual(result.first { $0.id == placed.id }, placed)
+        XCTAssertEqual(result.first { $0.id == codex.id }, codex)
+    }
+    func testExpiredUnplacedRecordDoesNotBlockClaudeFallback() {
+        let result = rows([record("done", terminal: nil, seconds: 100)], layout("◑ Task"))
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result.first?.ghosttyTerminalId, "T")
+        XCTAssertEqual(result.first?.state, "working")
+    }
     func testAmbiguousCodexNamesAreNotAssigned() {
         let r = rows([], layout("Task | repo"), names: ["A": "Task", "B": "Task"])
         XCTAssertEqual(r.first?.agent, "terminal")
@@ -111,7 +162,7 @@ final class StatusTests {
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00.123Z"))
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00Z"))
         XCTAssertEqual(rows([record("done")], layout()).first?.state, "done")
-        XCTAssertTrue(rows([record("done", seconds: 100)], layout()).isEmpty)
+        XCTAssertTrue(rows([record("done", seconds: 100)], layout("zsh")).isEmpty)
     }
     func testCodexSpinnerDoesNotBecomePartOfIdentity() {
         XCTAssertEqual(Reconcile.titleName("⠧ Task | repo"), "Task")
