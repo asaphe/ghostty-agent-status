@@ -123,6 +123,23 @@ class StateTests(unittest.TestCase):
                                    "transcript_path": str(rollout)})
             self.assertFalse((status / "codex-T1.json").exists())
 
+    def test_codex_thread_without_a_rollout_waits_for_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, work = Path(tmp) / "status", Path(tmp) / "work"
+            payload = {"session_id": "T1", "hook_event_name": "UserPromptSubmit", "cwd": tmp}
+            with patch.object(s, "STATUS_DIR", status), patch.object(s, "WORK_DIR", work), \
+                    patch.object(s, "CODEX_HOME", Path(tmp) / "codex"), \
+                    patch.object(s, "process_owner", return_value=(42, None, True)), \
+                    patch.object(s, "codex_tuis", return_value=[{"pid": 7}]), \
+                    patch.object(s, "git_info", return_value=("repo", "main", True)), \
+                    patch.object(s, "spawn_worker"):
+                s.update("codex", payload)
+                self.assertFalse((status / "codex-T1.json").exists())
+                rollout = Path(tmp) / "rollout.jsonl"
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"source": "cli"}}) + "\n")
+                s.update("codex", {**payload, "transcript_path": str(rollout)})
+                self.assertTrue((status / "codex-T1.json").exists())
+
     def test_events_map_to_states(self):
         cases = [
             ({"hook_event_name": "SessionStart"}, ("idle", None)),

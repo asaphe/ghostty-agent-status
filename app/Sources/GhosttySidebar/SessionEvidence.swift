@@ -175,6 +175,7 @@ enum Reconcile {
             for (id, place) in layout.places where rows[id] == nil {
                 let title = titleName(place.title)
                 let matches = names.filter { $0.value == title && place.title.contains(" | ") }
+                if matches.isEmpty { continue }
                 let unique = matches.count == 1 && layout.places.values.filter { titleName($0.title) == title }.count == 1
                 let sessionId = unique ? matches.first!.key : id
                 let agent = unique ? "codex" : "terminal"

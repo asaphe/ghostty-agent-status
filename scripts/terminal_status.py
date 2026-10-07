@@ -20,7 +20,8 @@ belongs to whichever tab started it, so the terminal is the Ghostty Codex TUI
 that resumed the thread, else the only one that took input just now, else the
 only unclaimed one in the session's directory; anything else stays unresolved.
 A Codex thread whose rollout source is not "cli" (exec runs, VS Code, subagents)
-has no tab of its own and gets no status file.
+has no tab of its own and gets no status file; neither does one with no rollout
+yet, which ephemeral threads never write.
 
 The Ghostty work runs in a detached worker (`terminal_status.py apply ...`) so a
 hook returns in milliseconds.
@@ -429,9 +430,10 @@ def update(agent: str, payload: dict) -> None:
         old = read_status(agent, session_id)
         tracking_path = WORK_DIR / "events" / f"{_key(agent, session_id)}.json"
         tracking = _read_json(tracking_path)
-        if agent == "codex" and "source" not in tracking:
+        # Ephemeral threads (Claude's Codex plugin) never write a rollout, so a missing one is rechecked, not trusted.
+        if agent == "codex" and tracking.get("source") is None:
             tracking["source"] = codex_source(payload, session_id)
-        if tracking.get("source") not in ("cli", None):
+        if agent == "codex" and tracking.get("source") != "cli":
             status_path(agent, session_id).unlink(missing_ok=True)
             _write_json(tracking_path, tracking)
             return
