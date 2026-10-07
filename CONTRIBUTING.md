@@ -23,6 +23,12 @@ bash app/test.sh                                        # Swift reconciliation t
 swift build -c release --package-path app
 ```
 
+## Versioning
+
+`claude plugin update` compares the `version` in `.claude-plugin/plugin.json`, so a change
+that does not bump it never reaches installed copies. Bump it in every PR that changes the
+plugin (hooks, scripts, commands): patch for fixes, minor for new behaviour.
+
 ## Changing how a state is decided
 
 Agent CLIs change their events and transcript formats between releases. A change
