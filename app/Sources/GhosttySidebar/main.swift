@@ -41,8 +41,7 @@ final class StatusStore: ObservableObject {
         for (n, windowId) in windowOrder.enumerated() {
             guard let members = byWindow[windowId] else { continue }
             let rows = members.sorted { ($0.0.tabIndex, $0.0.splitIndex) < ($1.0.tabIndex, $1.0.splitIndex) }.map(\.1)
-            var title = "Window \(n + 1) · \(layout.tabCounts[windowId] ?? rows.count) tabs"
-            if windowId == layout.frontWindowId { title += " · front" }
+            let title = "Window \(n + 1) · \(layout.tabCounts[windowId] ?? rows.count) tabs"
             result.append(SessionGroup(id: windowId, title: title, sessions: rows))
         }
         if !unplaced.isEmpty {
@@ -283,8 +282,8 @@ struct SidebarView: View {
                 Spacer()
                 Text("\(store.count)").font(.caption).foregroundStyle(.secondary)
             }
-            .padding(10)
-            .padding(.top, 6)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
             Divider()
             if let warning = store.refreshWarning {
                 Text(warning).font(.caption).foregroundStyle(.orange).padding(8)

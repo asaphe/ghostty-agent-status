@@ -19,8 +19,9 @@ terminal. Codex runs hooks in a shared app-server daemon whose environment
 belongs to whichever tab started it, so the terminal is the Ghostty Codex TUI
 that resumed the thread, else the only one that took input just now, else the
 only unclaimed one in the session's directory; anything else stays unresolved.
-A Codex thread whose rollout source is not "cli" (exec runs, VS Code, subagents)
-has no tab of its own and gets no status file.
+Only a Codex TUI thread (rollout originator "codex-tui", not a subagent) has a
+tab of its own; exec runs, subagents and threads with no rollout yet, which
+ephemeral threads never write, get no status file.
 
 The Ghostty work runs in a detached worker (`terminal_status.py apply ...`) so a
 hook returns in milliseconds.
@@ -388,15 +389,18 @@ def pick_codex_tui(session_id: str, event: str, cwd: str, tuis: list[dict], clai
     return here[0] if len(here) == 1 else None
 
 
-def codex_source(payload: dict, session_id: str) -> object:
-    """The thread's session_meta `source`: "cli" for a TUI tab; exec, vscode and subagent threads have no tab of their own."""
+def codex_tab(payload: dict, session_id: str) -> bool | None:
+    """Whether the thread is a TUI tab, from its session_meta; None while it has no rollout."""
     path = payload.get("transcript_path")
     paths = [Path(path)] if path else list((CODEX_HOME / "sessions").rglob(f"*{session_id}.jsonl"))
     for rollout in paths:
         with contextlib.suppress(OSError, ValueError), rollout.open(encoding="utf-8") as fh:
             row = json.loads(fh.readline())
             if row.get("type") == "session_meta":
-                return row.get("payload", {}).get("source")
+                meta = row.get("payload", {})
+                # TUI threads record source "vscode" as often as "cli"; before codex-tui, the TUI's originator was codex_cli_rs.
+                originator, source = meta.get("originator"), meta.get("source")
+                return (originator == "codex-tui" and source in ("cli", "vscode")) or (originator == "codex_cli_rs" and source == "cli")
     return None
 
 
@@ -429,9 +433,10 @@ def update(agent: str, payload: dict) -> None:
         old = read_status(agent, session_id)
         tracking_path = WORK_DIR / "events" / f"{_key(agent, session_id)}.json"
         tracking = _read_json(tracking_path)
-        if agent == "codex" and "source" not in tracking:
-            tracking["source"] = codex_source(payload, session_id)
-        if tracking.get("source") not in ("cli", None):
+        # Ephemeral threads (Claude's Codex plugin) never write a rollout, so a missing one is rechecked, not trusted.
+        if agent == "codex" and tracking.get("tab") is None:
+            tracking["tab"] = codex_tab(payload, session_id)
+        if agent == "codex" and not tracking.get("tab"):
             status_path(agent, session_id).unlink(missing_ok=True)
             _write_json(tracking_path, tracking)
             return

@@ -25,7 +25,7 @@ final class StatusTests {
         tests.testOneNewestSessionPerTerminal()
         tests.testClosedTerminalDoesNotLeaveGhostRow()
         tests.testMissingCodexHookRecoveredFromSession()
-        tests.testUnidentifiedTerminalIsVisibleAndHonest()
+        tests.testTerminalWithoutAgentIsHidden()
         tests.testAmbiguousCodexNamesAreNotAssigned()
         tests.testFractionalTimestampsAndDoneGrace()
         tests.testCodexSpinnerDoesNotBecomePartOfIdentity()
@@ -99,10 +99,9 @@ final class StatusTests {
         XCTAssertEqual(r.first?.state, "idle")
         XCTAssertEqual(r.first?.ghosttyTerminalId, "T")
     }
-    func testUnidentifiedTerminalIsVisibleAndHonest() {
-        let r = rows([], layout("zsh"))
-        XCTAssertEqual(r.first?.state, "unknown")
-        XCTAssertEqual(r.first?.ghosttyTerminalId, "T")
+    func testTerminalWithoutAgentIsHidden() {
+        XCTAssertTrue(rows([], layout("zsh")).isEmpty)
+        XCTAssertTrue(rows([], layout("Task | repo"), names: ["S": "Other"]).isEmpty)
     }
     func testAmbiguousCodexNamesAreNotAssigned() {
         let r = rows([], layout("Task | repo"), names: ["A": "Task", "B": "Task"])
@@ -112,7 +111,7 @@ final class StatusTests {
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00.123Z"))
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00Z"))
         XCTAssertEqual(rows([record("done")], layout()).first?.state, "done")
-        XCTAssertEqual(rows([record("done", seconds: 100)], layout()).first?.state, "unknown")
+        XCTAssertTrue(rows([record("done", seconds: 100)], layout()).isEmpty)
     }
     func testCodexSpinnerDoesNotBecomePartOfIdentity() {
         XCTAssertEqual(Reconcile.titleName("⠧ Task | repo"), "Task")

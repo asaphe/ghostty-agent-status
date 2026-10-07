@@ -123,6 +123,38 @@ class StateTests(unittest.TestCase):
                                    "transcript_path": str(rollout)})
             self.assertFalse((status / "codex-T1.json").exists())
 
+    def test_codex_thread_without_a_rollout_waits_for_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status, work = Path(tmp) / "status", Path(tmp) / "work"
+            payload = {"session_id": "T1", "hook_event_name": "UserPromptSubmit", "cwd": tmp}
+            with patch.object(s, "STATUS_DIR", status), patch.object(s, "WORK_DIR", work), \
+                    patch.object(s, "CODEX_HOME", Path(tmp) / "codex"), \
+                    patch.object(s, "process_owner", return_value=(42, None, True)), \
+                    patch.object(s, "codex_tuis", return_value=[{"pid": 7}]), \
+                    patch.object(s, "git_info", return_value=("repo", "main", True)), \
+                    patch.object(s, "spawn_worker"):
+                s.update("codex", payload)
+                self.assertFalse((status / "codex-T1.json").exists())
+                rollout = Path(tmp) / "rollout.jsonl"
+                meta = {"originator": "codex-tui", "source": "vscode"}
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+                s.update("codex", {**payload, "transcript_path": str(rollout)})
+                self.assertTrue((status / "codex-T1.json").exists())
+
+    def test_only_tui_threads_count_as_tabs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            cases = [({"originator": "codex-tui", "source": "cli"}, True),
+                     ({"originator": "codex-tui", "source": "vscode"}, True),
+                     ({"originator": "codex-tui", "source": {"subagent": "review"}}, False),
+                     ({"originator": "codex_cli_rs", "source": "cli"}, True),
+                     ({"originator": "codex_exec", "source": "exec"}, False),
+                     ({"originator": "Claude Code", "source": "vscode"}, False),
+                     ({"originator": "Codex Desktop", "source": "vscode"}, False)]
+            for meta, expected in cases:
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+                self.assertEqual(s.codex_tab({"transcript_path": str(rollout)}, "T1"), expected, meta)
+
     def test_events_map_to_states(self):
         cases = [
             ({"hook_event_name": "SessionStart"}, ("idle", None)),
@@ -276,7 +308,7 @@ class StatusFileTests(unittest.TestCase):
         payload = {"session_id": "sid-1", "hook_event_name": "UserPromptSubmit", "cwd": str(Path(__file__).parent)}
         with patch.object(s, "process_owner", return_value=(os.getpid(), None, True)), \
                 patch.object(s, "codex_tuis", return_value=[{"pid": 1}]), \
-                patch.object(s, "codex_source", return_value="cli"), \
+                patch.object(s, "codex_tab", return_value=True), \
                 patch.object(s, "codex_thread_name", return_value="Named thread"):
             s.update("codex", payload)
         self.assertEqual(s.read_status("codex", "sid-1")["title"], "Named thread")
