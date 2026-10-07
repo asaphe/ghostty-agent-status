@@ -398,8 +398,9 @@ def codex_tab(payload: dict, session_id: str) -> bool | None:
             row = json.loads(fh.readline())
             if row.get("type") == "session_meta":
                 meta = row.get("payload", {})
-                # TUI threads record source "vscode" as often as "cli"; a subagent's source is an object.
-                return meta.get("originator") == "codex-tui" and meta.get("source") in ("cli", "vscode")
+                # TUI threads record source "vscode" as often as "cli"; before codex-tui, the TUI's originator was codex_cli_rs.
+                originator, source = meta.get("originator"), meta.get("source")
+                return (originator == "codex-tui" and source in ("cli", "vscode")) or (originator == "codex_cli_rs" and source == "cli")
     return None
 
 

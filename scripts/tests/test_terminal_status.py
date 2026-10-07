@@ -147,7 +147,10 @@ class StateTests(unittest.TestCase):
             cases = [({"originator": "codex-tui", "source": "cli"}, True),
                      ({"originator": "codex-tui", "source": "vscode"}, True),
                      ({"originator": "codex-tui", "source": {"subagent": "review"}}, False),
-                     ({"originator": "codex_exec", "source": "exec"}, False)]
+                     ({"originator": "codex_cli_rs", "source": "cli"}, True),
+                     ({"originator": "codex_exec", "source": "exec"}, False),
+                     ({"originator": "Claude Code", "source": "vscode"}, False),
+                     ({"originator": "Codex Desktop", "source": "vscode"}, False)]
             for meta, expected in cases:
                 rollout.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
                 self.assertEqual(s.codex_tab({"transcript_path": str(rollout)}, "T1"), expected, meta)
