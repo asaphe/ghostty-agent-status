@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python tests (macOS system Python, the oldest supported)
+        run: /usr/bin/python3 -m unittest discover -s scripts/tests -v
+      - name: Manifests are valid JSON
+        run: for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json; do python3 -m json.tool "$f" >/dev/null; done
+      - name: Swift reconciliation tests
+        run: bash app/test.sh
+      - name: App builds
+        run: swift build -c release --package-path app

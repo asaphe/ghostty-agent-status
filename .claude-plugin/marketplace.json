@@ -1,0 +1,14 @@
+{
+  "name": "ghostty-agent-status",
+  "description": "Live working / waiting / idle status for Claude Code and Codex sessions in Ghostty tabs, plus a menu-bar sidebar that lists every session and jumps to its tab.",
+  "owner": {
+    "name": "asaphe"
+  },
+  "plugins": [
+    {
+      "name": "ghostty-agent-status",
+      "source": "./",
+      "description": "Live working / waiting / idle status for Claude Code and Codex sessions in Ghostty tabs, plus a menu-bar sidebar that lists every session and jumps to its tab."
+    }
+  ]
+}

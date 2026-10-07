@@ -1,0 +1,18 @@
+{
+  "name": "ghostty-agent-status",
+  "description": "Live working / waiting / idle status for Claude Code and Codex sessions in Ghostty tabs, plus a menu-bar sidebar that lists every session and jumps to its tab.",
+  "version": "0.1.0",
+  "author": {
+    "name": "asaphe"
+  },
+  "homepage": "https://github.com/asaphe/ghostty-agent-status",
+  "repository": "https://github.com/asaphe/ghostty-agent-status",
+  "license": "MIT",
+  "keywords": [
+    "ghostty",
+    "status",
+    "hooks",
+    "codex",
+    "macos"
+  ]
+}
