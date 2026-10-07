@@ -175,7 +175,14 @@ enum Reconcile {
             for (id, place) in layout.places where rows[id] == nil {
                 let title = titleName(place.title)
                 let matches = names.filter { $0.value == title && place.title.contains(" | ") }
-                if matches.isEmpty { continue }
+                if matches.isEmpty {
+                    guard let activity = claudeActivity(place.title) else { continue }
+                    let name = String(place.title.dropFirst(2))
+                    rows[id] = SessionStatus(agent: "claude", sessionId: id, state: activity,
+                        title: name.isEmpty ? "Claude Code" : name, cwd: place.cwd, repo: nil, branch: nil, color: nil,
+                        ghosttyTerminalId: id, pid: nil, updatedAt: nil, message: "Status from terminal title")
+                    continue
+                }
                 let unique = matches.count == 1 && layout.places.values.filter { titleName($0.title) == title }.count == 1
                 let sessionId = unique ? matches.first!.key : id
                 let agent = unique ? "codex" : "terminal"

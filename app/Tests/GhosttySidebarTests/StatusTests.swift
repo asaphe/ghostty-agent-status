@@ -26,6 +26,7 @@ final class StatusTests {
         tests.testClosedTerminalDoesNotLeaveGhostRow()
         tests.testMissingCodexHookRecoveredFromSession()
         tests.testTerminalWithoutAgentIsHidden()
+        tests.testClaudeTabWithoutRecordIsShownFromTitle()
         tests.testAmbiguousCodexNamesAreNotAssigned()
         tests.testFractionalTimestampsAndDoneGrace()
         tests.testCodexSpinnerDoesNotBecomePartOfIdentity()
@@ -35,7 +36,7 @@ final class StatusTests {
         tests.testTwoTabsWithSameTitleAreAmbiguous()
         tests.testSubsecondTranscriptCannotOverridePermissionHook()
         try tests.testPartialTranscriptLineDoesNotDiscardLastCompleteEvent()
-        print("18 status tests passed")
+        print("19 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -103,6 +104,15 @@ final class StatusTests {
         XCTAssertTrue(rows([], layout("zsh")).isEmpty)
         XCTAssertTrue(rows([], layout("Task | repo"), names: ["S": "Other"]).isEmpty)
     }
+    func testClaudeTabWithoutRecordIsShownFromTitle() {
+        let working = rows([], layout("◑ Task"))
+        XCTAssertEqual(working.count, 1)
+        XCTAssertEqual(working.first?.agent, "claude")
+        XCTAssertEqual(working.first?.state, "working")
+        XCTAssertEqual(working.first?.title, "Task")
+        XCTAssertEqual(working.first?.ghosttyTerminalId, "T")
+        XCTAssertEqual(rows([], layout("✳ Task")).first?.state, "idle")
+    }
     func testAmbiguousCodexNamesAreNotAssigned() {
         let r = rows([], layout("Task | repo"), names: ["A": "Task", "B": "Task"])
         XCTAssertEqual(r.first?.agent, "terminal")
@@ -111,7 +121,7 @@ final class StatusTests {
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00.123Z"))
         XCTAssertNotNil(timestamp("2026-10-07T09:00:00Z"))
         XCTAssertEqual(rows([record("done")], layout()).first?.state, "done")
-        XCTAssertTrue(rows([record("done", seconds: 100)], layout()).isEmpty)
+        XCTAssertTrue(rows([record("done", seconds: 100)], layout("zsh")).isEmpty)
     }
     func testCodexSpinnerDoesNotBecomePartOfIdentity() {
         XCTAssertEqual(Reconcile.titleName("⠧ Task | repo"), "Task")
