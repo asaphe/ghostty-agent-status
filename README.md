@@ -79,6 +79,8 @@ One JSON file per session at `$GHOSTTY_AGENT_STATUS_DIR/status/<agent>-<session_
 
 Files of sessions that ended more than a day ago are removed.
 
+The Claude Code hooks run `python3` from `PATH`. To use another interpreter, for example to skip a slow pyenv or asdf shim, set `GHOSTTY_AGENT_STATUS_PYTHON` in the `env` block of `~/.claude/settings.json`.
+
 ### Labeling a tab
 
 A script can give a tab a label, and optionally a milestone, that survives status updates:

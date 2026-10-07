@@ -109,5 +109,5 @@ Then:
 | No status file appears | The session started before the plugin was installed, or outside Ghostty (`echo $TERM_PROGRAM` must print `ghostty`). Start a new session in Ghostty. |
 | Row stuck under "Tab not identified yet" | The tab could not be matched yet. It resolves on the session's next event. Matching works by briefly retitling the tab, so it can miss while the agent redraws its title. |
 | Sidebar says "Ghostty refresh failed" | AppleScript to Ghostty was denied. Re-allow it in System Settings → Privacy & Security → Automation. |
-| Hook timeouts in the transcript | Python start-up is slow. The hooks run the first `python3` on `PATH`, and a version-manager shim (pyenv, asdf) can add about a second per event on a busy machine. Put a direct interpreter earlier on `PATH`. |
+| Hook timeouts in the transcript | Python start-up is slow. The hooks run the first `python3` on `PATH`, and a version-manager shim (pyenv, asdf) can add about a second per event on a busy machine. Set `GHOSTTY_AGENT_STATUS_PYTHON` to a direct interpreter path in the `env` block of `~/.claude/settings.json`, e.g. `"GHOSTTY_AGENT_STATUS_PYTHON": "/usr/bin/python3"`, then start a new session. |
 | Codex rows never appear | The hook isn't trusted yet in the Codex TUI, or the thread predates the install. |
