@@ -5,7 +5,7 @@ See at a glance which of your Claude Code and Codex sessions are **working**, **
 Two parts, usable separately:
 
 - **The plugin (hooks).** Every session event updates a small status file and the tab's title: ⏳ working, ✋ waiting for you, 💤 idle, 🏁 done. A colored square marks the repo and branch. This alone makes Ghostty's tab bar a status board.
-- **The sidebar app.** A floating "Session Status" panel, grouped by window in tab order, shown while Ghostty is in front. Click a row to jump to its tab.
+- **The sidebar app.** A floating "Session Status" panel listing sessions in tab order, with a divider between windows, shown while Ghostty is in front. Click a row to jump to its tab. The panel attaches to one Ghostty window and follows it when it moves; drag the panel onto another window (on any display) to attach it there, and it moves to the window with the most sessions when its window closes or when **One Sidebar per Window** is turned off. **One Sidebar per Window** gives each window its own panel, listing only that window's tabs.
 
 Requirements: macOS 14+, [Ghostty](https://ghostty.org) 1.3+ (it uses Ghostty's AppleScript support), Python 3.9+ (the macOS system Python is fine). The app also needs Xcode's command-line tools to build.
 
@@ -39,7 +39,7 @@ python3 ~/.local/share/ghostty-agent-status/codex/install.py
 
 Then start a new agent session in Ghostty: its tab title gets a status glyph on the first prompt.
 - **Codex:** trust the new hook in the TUI's hook review first.
-- **Sidebar app:** the first click on a row asks to let the app control Ghostty. The optional **Keep Ghostty Windows Beside Sidebar** menu item asks for Accessibility permission. The app is built locally, so it needs no Developer ID and macOS doesn't quarantine it. Each rebuild asks for those permissions again.
+- **Sidebar app:** the first click on a row asks to let the app control Ghostty. Attaching to windows needs Accessibility permission, asked for by **Attach to Front Window**, **One Sidebar per Window** or **Keep Ghostty Windows Beside Sidebar** (which narrows a window that leaves no room for the panel, and gives the width back when the panel leaves). Without it the panel docks to a screen edge. The app is built locally, so it needs no Developer ID and macOS doesn't quarantine it. It is signed against its bundle identifier, so the Accessibility grant survives rebuilds. The trade-off: an ad-hoc signature has no certificate to check, so any app built on this Mac with the same bundle identifier would inherit that grant. To tie the grant to a certificate instead, set `GHOSTTY_SIDEBAR_SIGN_IDENTITY` to the name of a code-signing certificate in your keychain before building; macOS then asks again only if the certificate changes.
 
 Inside Claude Code, `/ghostty-agent-status:install-app` builds the app from the installed plugin instead of a clone.
 

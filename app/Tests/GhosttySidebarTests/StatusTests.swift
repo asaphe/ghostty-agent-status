@@ -40,7 +40,14 @@ final class StatusTests {
         tests.testTwoTabsWithSameTitleAreAmbiguous()
         tests.testSubsecondTranscriptCannotOverridePermissionHook()
         try tests.testPartialTranscriptLineDoesNotDiscardLastCompleteEvent()
-        print("23 status tests passed")
+        tests.testPanelSitsBesideWindowWhenThereIsRoom()
+        tests.testWindowIsSqueezedOnlyWhenAsked()
+        tests.testNarrowWindowIsNotSqueezed()
+        tests.testFullScreenWindowGetsOverlay()
+        tests.testPanelFollowsWindowOnSecondScreen()
+        tests.testDropTargetPrefersLargestOverlapAndReachesBesideWindow()
+        tests.testWindowTitleMatchesOnlyWhenUnique()
+        print("30 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -201,5 +208,55 @@ final class StatusTests {
         defer { try? FileManager.default.removeItem(at: url) }
         try Data("{\"timestamp\":\"2026-10-07T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n{\"type\":".utf8).write(to: url)
         XCTAssertEqual(SessionEvidence.read(url, agent: "codex")?.state, "idle")
+    }
+
+    let screen = CGRect(x: 0, y: 25, width: 1920, height: 1055)
+
+    func testPanelSitsBesideWindowWhenThereIsRoom() {
+        let place = Placement.place(window: CGRect(x: 100, y: 100, width: 1000, height: 600), fullScreen: false,
+                                    screen: screen, width: 280, squeeze: true)
+        XCTAssertEqual(place, PanelPlacement(panel: CGRect(x: 1100, y: 100, width: 280, height: 600)))
+    }
+    func testWindowIsSqueezedOnlyWhenAsked() {
+        let window = CGRect(x: 0, y: 25, width: 1920, height: 1055)
+        XCTAssertEqual(Placement.place(window: window, fullScreen: false, screen: screen, width: 280, squeeze: true),
+                       PanelPlacement(panel: CGRect(x: 1640, y: 25, width: 280, height: 1055),
+                                      window: CGRect(x: 0, y: 25, width: 1640, height: 1055)))
+        XCTAssertEqual(Placement.place(window: window, fullScreen: false, screen: screen, width: 280, squeeze: false),
+                       PanelPlacement(panel: CGRect(x: 1640, y: 25, width: 280, height: 1055)))
+    }
+    func testNarrowWindowIsNotSqueezed() {
+        let place = Placement.place(window: CGRect(x: 1500, y: 25, width: 420, height: 800), fullScreen: false,
+                                    screen: screen, width: 280, squeeze: true)
+        XCTAssertNil(place.window)
+        XCTAssertEqual(place.panel, CGRect(x: 1640, y: 25, width: 280, height: 800))
+    }
+    func testFullScreenWindowGetsOverlay() {
+        let window = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        XCTAssertEqual(Placement.place(window: window, fullScreen: true, screen: screen, width: 280, squeeze: true),
+                       PanelPlacement(panel: CGRect(x: 1640, y: 0, width: 280, height: 1080)))
+    }
+    func testPanelFollowsWindowOnSecondScreen() {
+        let left = CGRect(x: -1026, y: -1080, width: 1920, height: 1080)
+        let right = CGRect(x: 894, y: -1080, width: 1920, height: 1080)
+        let window = CGRect(x: 894, y: -1050, width: 1640, height: 1050)
+        XCTAssertEqual(Placement.screen(for: window, among: [screen, left, right]), right)
+        XCTAssertEqual(Placement.place(window: window, fullScreen: false, screen: right, width: 280, squeeze: true),
+                       PanelPlacement(panel: CGRect(x: 2534, y: -1050, width: 280, height: 1050)))
+    }
+    func testDropTargetPrefersLargestOverlapAndReachesBesideWindow() {
+        let windows = [CGRect(x: 0, y: 0, width: 800, height: 800), CGRect(x: 1000, y: 0, width: 800, height: 800)]
+        XCTAssertEqual(Placement.dropTarget(panel: CGRect(x: 950, y: 0, width: 280, height: 800), windows: windows), 1)
+        XCTAssertEqual(Placement.dropTarget(panel: CGRect(x: 820, y: 0, width: 150, height: 800), windows: windows), 0)
+        XCTAssertNil(Placement.dropTarget(panel: CGRect(x: 3000, y: 0, width: 280, height: 800), windows: windows))
+    }
+    func testWindowTitleMatchesOnlyWhenUnique() {
+        let layout = TabLayout(windowNames: ["W1": "zsh", "W2": "zsh", "W3": "Task"])
+        XCTAssertEqual(layout.windowId(titled: "Task"), "W3")
+        XCTAssertNil(layout.windowId(titled: "zsh"))
+        XCTAssertNil(layout.windowId(titled: "missing"))
+        let glyphs = TabLayout(windowNames: ["W1": "⏳🟩 Fix sidebar · [repo]", "W2": "~/git/repo"])
+        XCTAssertEqual(glyphs.windowId(titled: "✋🟩 Fix sidebar · [repo]"), "W1")
+        XCTAssertEqual(glyphs.windowId(titled: "~/git/repo"), "W2")
     }
 }
