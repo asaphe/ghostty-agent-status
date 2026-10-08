@@ -57,9 +57,9 @@ The script builds the app (about a minute the first time), installs `~/Applicati
 
 Tell the user to expect two permission prompts:
 - **Automation:** the first click on a row asks to let the app control Ghostty. It is needed to jump to the tab.
-- **Accessibility:** asked only if they turn on **Keep Ghostty Windows Beside Sidebar** in the menu-bar menu.
+- **Accessibility:** lets the panel attach to a Ghostty window and follow it. Asked when they choose **Attach to Front Window**, **One Sidebar per Window** or **Keep Ghostty Windows Beside Sidebar** in the menu-bar menu; without it the panel docks to a screen edge.
 
-Each rebuild changes the app's ad-hoc signature, so macOS asks again after an update.
+The app is signed against its bundle identifier, so the grants survive rebuilds. A grant made before that change (or one that stops working: the sidebar shows an orange Accessibility warning) has to be removed with **−** in System Settings → Privacy & Security → Accessibility and granted again; switching it off and on does not help.
 
 **Optional:** to start the app at login, the user adds it under System Settings → General → Login Items.
 

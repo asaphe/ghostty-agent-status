@@ -28,6 +28,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$app"
+# An ad-hoc signature's default requirement is its cdhash, which orphans the Accessibility grant on every rebuild.
+codesign --force --sign - -r='designated => identifier "io.github.asaphe.ghostty-agent-status"' "$app"
 echo "installed: $app"
 open "$app"

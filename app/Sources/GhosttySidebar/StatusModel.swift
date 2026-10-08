@@ -49,6 +49,20 @@ struct TabLayout: Equatable {
     var places: [String: TerminalPlace] = [:]
     var frontWindowId: String?
     var tabCounts: [String: Int] = [:]
+    var windowNames: [String: String] = [:]
+
+    // Ghostty's scripting ids and Accessibility windows share nothing but the title, so a duplicated title matches nothing.
+    func windowId(titled title: String) -> String? {
+        let key = Self.stableTitle(title)
+        let matches = windowNames.filter { Self.stableTitle($0.value) == key }
+        return matches.count == 1 ? matches.first?.key : nil
+    }
+
+    // Status glyphs at the front of a title change with the agent's state; the rest names the window.
+    static func stableTitle(_ title: String) -> String {
+        String(String.UnicodeScalarView(title.unicodeScalars.filter { !$0.properties.isEmojiPresentation }))
+            .trimmingCharacters(in: .whitespaces)
+    }
 
     func preservingTitles(from previous: TabLayout) -> TabLayout {
         var result = self
@@ -65,4 +79,5 @@ struct SessionGroup: Identifiable, Equatable {
     let id: String
     let title: String
     let sessions: [SessionStatus]
+    var notes: [String: String] = [:]
 }
