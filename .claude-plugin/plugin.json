@@ -1,7 +1,7 @@
 {
   "name": "ghostty-agent-status",
   "description": "Live working / waiting / idle status for Claude Code and Codex sessions in Ghostty tabs, plus a menu-bar sidebar that lists every session and jumps to its tab.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "asaphe"
   },
