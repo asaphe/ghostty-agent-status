@@ -60,8 +60,8 @@ struct TabLayout: Equatable {
 
     // Status glyphs at the front of a title change with the agent's state; the rest names the window.
     static func stableTitle(_ title: String) -> String {
-        String(String.UnicodeScalarView(title.unicodeScalars.filter { !$0.properties.isEmojiPresentation }))
-            .trimmingCharacters(in: .whitespaces)
+        let rest = title.unicodeScalars.drop { $0.properties.isEmojiPresentation || $0.properties.isWhitespace || $0.value == 0xFE0F }
+        return String(String.UnicodeScalarView(rest)).trimmingCharacters(in: .whitespaces)
     }
 
     func preservingTitles(from previous: TabLayout) -> TabLayout {

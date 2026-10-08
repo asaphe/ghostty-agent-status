@@ -212,24 +212,34 @@ enum Ghostty {
         let fullScreen: Bool
     }
 
-    // Front-to-back. Hidden native tabs share their group's frame, so only the frontmost window per frame is kept.
+    // Front-to-back. Hidden native tabs share their group's frame but are off screen, so each frame is kept as many
+    // times as the window server shows an on-screen Ghostty window there.
     static func windows() -> [Window] {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first else { return [] }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(axApp, 0.5)
         guard let elements = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else { return [] }
+        var onScreen = onScreenWindows().map(\.frame)
         var result: [Window] = []
         for element in elements {
+            AXUIElementSetMessagingTimeout(element, 0.5)
             guard attribute(element, kAXSubroleAttribute) as? String == kAXStandardWindowSubrole as String,
                   attribute(element, kAXMinimizedAttribute) as? Bool != true,
-                  let frame = axFrame(element), !result.contains(where: { $0.frame == frame }) else { continue }
+                  let frame = axFrame(element), let slot = onScreen.firstIndex(where: { sameFrame($0, frame) }) else { continue }
+            onScreen.remove(at: slot)
             result.append(Window(element: element, frame: frame, title: attribute(element, kAXTitleAttribute) as? String ?? "",
                                  fullScreen: attribute(element, "AXFullScreen") as? Bool == true))
         }
         return result
     }
 
+    // Accessibility and the window server can round the same frame differently.
+    static func sameFrame(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) <= 1 && abs(a.minY - b.minY) <= 1 && abs(a.width - b.width) <= 1 && abs(a.height - b.height) <= 1
+    }
+
     static func window(_ element: AXUIElement) -> Window? {
+        AXUIElementSetMessagingTimeout(element, 0.5)
         guard attribute(element, kAXMinimizedAttribute) as? Bool != true, let frame = axFrame(element) else { return nil }
         return Window(element: element, frame: frame, title: attribute(element, kAXTitleAttribute) as? String ?? "",
                       fullScreen: attribute(element, "AXFullScreen") as? Bool == true)
@@ -505,8 +515,9 @@ final class SidebarController {
     func follow(squeeze: Bool, allowDrop: Bool) -> Ghostty.Window? {
         let mouseDown = NSEvent.pressedMouseButtons != 0
         if let placed, panel.frame != placed, mouseDown { dragging = true }
+        // Mid-drag the Accessibility frame lags; `track` moves the panel until the button is released.
+        if mouseDown { return window.flatMap(Ghostty.window) }
         if dragging {
-            if mouseDown { return window.flatMap(Ghostty.window) }
             dragging = false
             placed = nil
             if allowDrop {
@@ -536,8 +547,8 @@ final class SidebarController {
         var rect = place.panel
         if squeezed?.appliedWidth == frame.width { rect.origin.x = min(frame.maxX, screen.maxX - width) }
         windowFrame = frame
-        if liveWindowID.flatMap(Ghostty.liveFrame) != frame {
-            liveWindowID = Ghostty.onScreenWindows().first { $0.frame == frame }?.id
+        if !(liveWindowID.flatMap(Ghostty.liveFrame).map { Ghostty.sameFrame($0, frame) } ?? false) {
+            liveWindowID = Ghostty.onScreenWindows().first { Ghostty.sameFrame($0.frame, frame) }?.id
         }
         let target = Screens.flip(rect)
         if panel.frame != target { panel.setFrame(target, display: true) }
@@ -547,13 +558,15 @@ final class SidebarController {
 
     // Shown only while nothing stacked above its Ghostty window covers the spot, so each display behaves on its own.
     func updateVisibility(enabled: Bool) {
+        if !enabled { dragging = false }
         let rect = Screens.flip(panel.frame)
-        let show = enabled && !dragging && liveWindowID.map { Ghostty.liveFrame($0) != nil && !Ghostty.covered(above: $0, rect) } ?? false
-        guard show || dragging else {
+        // No window-server match means coverage is unknown, so the panel stays shown rather than vanishing.
+        let uncovered = liveWindowID.map { Ghostty.liveFrame($0) != nil && !Ghostty.covered(above: $0, rect) } ?? (window != nil)
+        guard enabled && (uncovered || dragging) else {
             if panel.isVisible { panel.orderOut(nil) }
             return
         }
-        if !panel.isVisible || Ghostty.covered(above: CGWindowID(panel.windowNumber), rect) { panel.orderFront(nil) }
+        if !panel.isVisible || Ghostty.covered(above: CGWindowID(panel.windowNumber), rect) { panel.orderFrontRegardless() }
     }
 
     // Mid-drag fast path: moves only the panel, from the window server's live frame; `follow` does the rest on release.
@@ -608,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let timer { RunLoop.main.add(timer, forMode: .common) }
         dragTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.enabled, self.trusted, NSEvent.pressedMouseButtons != 0 else { return }
+                guard let self, self.enabled, self.trusted, NSEvent.pressedMouseButtons != 0, Ghostty.isFrontmost else { return }
                 self.controllers.forEach { $0.track() }
             }
         }
@@ -679,14 +692,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.accessibilityWarning = warning
             trace("accessibility trusted: \(trusted)")
         }
-        if perWindow && !trusted && controllers.isEmpty { controllers = [makeController(autosaveName: "GhosttySidebar")] }
+        if !trusted && (controllers.count != 1 || controllers.first?.filter.scope != .all) {
+            controllers.forEach { $0.close() }
+            controllers = [makeController(autosaveName: "GhosttySidebar")]
+        }
         guard trusted else {
             let ownAppFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid()
             let show = enabled && (Ghostty.isFrontmost || ownAppFront)
             for c in controllers {
                 c.panel.level = .floating
                 if show { c.dockToScreen() }
-                if show && !c.panel.isVisible { c.panel.orderFront(nil) }
+                if show && !c.panel.isVisible { c.panel.orderFrontRegardless() }
                 if !show && !ownAppFront && c.panel.isVisible { c.panel.orderOut(nil) }
             }
             return

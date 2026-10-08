@@ -59,7 +59,7 @@ Tell the user to expect two permission prompts:
 - **Automation:** the first click on a row asks to let the app control Ghostty. It is needed to jump to the tab.
 - **Accessibility:** lets the panel attach to a Ghostty window and follow it. Asked when they choose **Attach to Front Window**, **One Sidebar per Window** or **Keep Ghostty Windows Beside Sidebar** in the menu-bar menu; without it the panel docks to a screen edge.
 
-The app is signed against its bundle identifier, so the grants survive rebuilds. A grant made before that change (or one that stops working: the sidebar shows an orange Accessibility warning) has to be removed with **−** in System Settings → Privacy & Security → Accessibility and granted again; switching it off and on does not help.
+The app is signed against its bundle identifier, so the grants survive rebuilds. Without a certificate, any app built on this Mac with the same bundle identifier would inherit them; README.md describes signing with a keychain certificate instead. A grant made before that change (or one that stops working: the sidebar shows an orange Accessibility warning) has to be removed with **−** in System Settings → Privacy & Security → Accessibility and granted again; switching it off and on does not help.
 
 **Optional:** to start the app at login, the user adds it under System Settings → General → Login Items.
 
