@@ -106,6 +106,70 @@ class StateTests(unittest.TestCase):
         self.assertEqual(s.transition({"state": "waiting"}, done, tracking)[0], "waiting")
         self.assertEqual(s.transition({"state": "waiting"}, {**done, "tool_input": {"command": "b"}}, tracking)[0], "working")
 
+    def test_codex_permission_description_is_not_call_identity(self):
+        tracking = {}
+        request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                   "tool_input": {"command": "git status --short", "description": "Read branch state"}}
+        s.transition({"state": "working"}, request, tracking)
+        result = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "call-1",
+                  "tool_input": {"command": "git status --short"}}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking), ("working", None))
+        self.assertEqual(tracking["pending"], {})
+
+    def test_call_identity_keeps_non_description_arguments(self):
+        base = {"tool_name": "Bash", "tool_input": {"command": "echo hello", "timeout": 10}}
+        other = {**base, "tool_input": {"command": "echo hello", "timeout": 20}}
+        self.assertNotEqual(s.call_key(base), s.call_key(other))
+        for tool in ("mcp.tool", "Edit"):
+            first = {"tool_name": tool, "tool_input": {"description": "first"}}
+            second = {**first, "tool_input": {"description": "second"}}
+            self.assertNotEqual(s.call_key(first), s.call_key(second))
+
+    def test_permission_failure_clears_only_its_own_actor(self):
+        tracking = {}
+        request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                   "tool_input": {"command": "test", "description": "Read context"}}
+        s.transition({"state": "working"}, request, tracking)
+        s.transition({"state": "waiting"}, {**request, "agent_id": "child"}, tracking)
+        result = {"hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "test"}}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking)[0], "waiting")
+        self.assertEqual(len(tracking["pending"]), 1)
+        self.assertEqual(s.transition({"state": "waiting"}, {**result, "agent_id": "child"}, tracking), ("working", None))
+
+    def test_codex_completion_preserves_another_permission(self):
+        tracking = {}
+        for command in ("first", "second"):
+            s.transition({"state": "working"}, {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                         "tool_input": {"command": command, "description": "Approval context"}}, tracking)
+        result = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "first"}}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking)[0], "waiting")
+        self.assertEqual(len(tracking["pending"]), 1)
+        result["tool_input"] = {"command": "second"}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking), ("working", None))
+
+    def test_subagent_completion_refreshes_background_work(self):
+        tracking = {}
+        tasks = [{"id": "a", "status": "running"}, {"id": "b", "status": "running"}]
+        self.assertEqual(s.transition({}, {"hook_event_name": "Stop", "background_tasks": tasks}, tracking),
+                         ("idle", "2 background tasks running"))
+        completion = {"hook_event_name": "SubagentStop", "agent_id": "a", "background_tasks": tasks[1:]}
+        self.assertEqual(s.transition({"state": "idle"}, completion, tracking), ("idle", "1 background task running"))
+        completion["background_tasks"] = []
+        self.assertEqual(s.transition({"state": "idle"}, completion, tracking), ("idle", None))
+
+    def test_subagent_completion_does_not_end_the_parent_turn(self):
+        tracking = {}
+        s.transition({}, {"hook_event_name": "UserPromptSubmit"}, tracking)
+        completion = {"hook_event_name": "SubagentStop", "agent_id": "a", "background_tasks": []}
+        self.assertIsNone(s.transition({"state": "working"}, completion, tracking))
+        self.assertEqual(tracking["main_state"], "working")
+
+    def test_idle_notification_preserves_reported_background_work(self):
+        tracking = {}
+        s.transition({}, {"hook_event_name": "Stop", "background_tasks": [{"status": "running"}]}, tracking)
+        self.assertEqual(s.transition({"state": "idle"}, {"hook_event_name": "Notification",
+                         "notification_type": "idle_prompt"}, tracking), ("idle", "1 background task running"))
+
     def test_stop_reports_running_background_tasks(self):
         tasks = [{"id": "a", "type": "subagent", "status": "running"}, {"id": "b", "type": "shell", "status": "completed"}]
         self.assertEqual(s.state_for({"hook_event_name": "Stop", "background_tasks": tasks}),
@@ -187,6 +251,22 @@ class TitleTests(unittest.TestCase):
         self.assertEqual(s.unprefixed(title), "DEV-1 work · milestone")
         self.assertEqual(s.unprefixed("🔔 " + title), "DEV-1 work · milestone")
         self.assertEqual(s.unprefixed("Plain label"), "Plain label")
+
+    def test_background_display_state_and_title_round_trip(self):
+        for count in (1, 2):
+            message = f"{count} background task{'s' if count != 1 else ''} running"
+            state = s.display_state({"state": "idle", "message": message})
+            self.assertEqual(state, "background")
+            title = s.compose(state, "#0005ff", "Work")
+            self.assertEqual(title, "🔄🟦 Work")
+            self.assertEqual(s.unprefixed(title), "Work")
+        for record in ({"state": "working", "message": "1 background task running"},
+                       {"state": "waiting", "message": "1 background task running"},
+                       {"state": "idle", "message": "0 background tasks running"},
+                       {"state": "idle", "message": "1 background tasks running"},
+                       {"state": "idle", "message": "2 background task running"},
+                       {"state": "idle", "message": "background task description"}):
+            self.assertEqual(s.display_state(record), record["state"])
 
     def test_agent_title_drops_the_spinner_only(self):
         self.assertEqual(s.agent_title("◑ Ghostty tab status · [cfg]"), "Ghostty tab status · [cfg]")
@@ -303,6 +383,30 @@ class StatusFileTests(unittest.TestCase):
         self.run_hook("PermissionRequest")
         self.assertEqual(len(self.spawned), 1)
         self.assertEqual(json.loads(s.status_path("claude", "sid-1").read_text())["state"], "waiting")
+
+    def test_background_completion_schedules_idle_title_refresh(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["ghostty_terminal_id"] = "T1"
+        s.write_status(record)
+        payload = {"session_id": "sid-1", "cwd": record["cwd"], "hook_event_name": "Stop",
+                   "background_tasks": [{"id": "a", "status": "running"}]}
+        s.update("claude", payload)
+        self.assertEqual(s.read_status("claude", "sid-1")["state"], "idle")
+        self.spawned.clear()
+        s.update("claude", {**payload, "hook_event_name": "SubagentStop", "agent_id": "a", "background_tasks": []})
+        self.assertEqual(s.read_status("claude", "sid-1")["message"], None)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_background_title_is_composed_from_the_written_record(self):
+        record = {"agent": "claude", "session_id": "sid-1", "state": "idle", "title": "Work",
+                  "ghostty_terminal_id": "T1", "color": "#0005ff", "message": "1 background task running"}
+        terminal = g.Terminal("T1", "tab", "window", "✳ Work", "💤🟦 Work", "/", False)
+        with patch.object(s.ghostty_tabs, "find", return_value=terminal), \
+                patch.object(s, "session_on", return_value=record), \
+                patch.object(s.ghostty_tabs, "set_tab_title") as title:
+            s.show("T1")
+        title.assert_called_once_with("T1", "🔄🟦 Work")
 
     def test_an_unresolved_codex_row_is_titled_by_its_thread_name(self):
         payload = {"session_id": "sid-1", "hook_event_name": "UserPromptSubmit", "cwd": str(Path(__file__).parent)}
