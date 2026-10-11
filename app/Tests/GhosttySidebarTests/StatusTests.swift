@@ -19,6 +19,7 @@ final class StatusTests {
         let tests = StatusTests()
         tests.testCompletedTurnRepairsLateBackgroundWorkingEvent()
         tests.testBackgroundTasksLeaveTheTurnIdleWithTheHookMessage()
+        tests.testBackgroundTaskDisplayDoesNotChangeTurnState()
         tests.testDeniedOrInterruptedTurnEndsWaiting()
         tests.testPermissionWaitSurvivesOlderToolCall()
         tests.testNewToolResultClearsPermissionWait()
@@ -42,12 +43,16 @@ final class StatusTests {
         try tests.testPartialTranscriptLineDoesNotDiscardLastCompleteEvent()
         tests.testPanelSitsBesideWindowWhenThereIsRoom()
         tests.testWindowIsSqueezedOnlyWhenAsked()
+        tests.testAdjacentWindowsReserveTheirOwnSidebarSpace()
+        tests.testReservationFitsOnNegativeCoordinateDisplay()
+        tests.testNarrowReservationStaysInsideItsWindow()
+        tests.testOversizedSidebarStaysInsideItsWindow()
         tests.testNarrowWindowIsNotSqueezed()
         tests.testFullScreenWindowGetsOverlay()
         tests.testPanelFollowsWindowOnSecondScreen()
         tests.testDropTargetPrefersLargestOverlapAndReachesBesideWindow()
         tests.testWindowTitleMatchesOnlyWhenUnique()
-        print("30 status tests passed")
+        print("35 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -73,6 +78,23 @@ final class StatusTests {
         let r = rows([record("idle")], layout("◑ Task"), source: Evidence(state: "idle", date: Date(timeIntervalSince1970: 950)))
         XCTAssertEqual(r.first?.state, "idle")
         XCTAssertEqual(r.first?.message, "old")
+    }
+    func testBackgroundTaskDisplayDoesNotChangeTurnState() {
+        for message in ["1 background task running", "2 background tasks running"] {
+            var session = record("idle")
+            session.message = message
+            XCTAssertEqual(session.displayState, "background")
+            XCTAssertEqual(session.state, "idle")
+            session.state = "waiting"
+            XCTAssertEqual(session.displayState, "waiting")
+            session.state = "working"
+            XCTAssertEqual(session.displayState, "working")
+        }
+        for message in ["0 background tasks running", "background tasks running", "turn failed", "1 background tasks running"] {
+            var session = record("idle")
+            session.message = message
+            XCTAssertEqual(session.displayState, "idle")
+        }
     }
     func testDeniedOrInterruptedTurnEndsWaiting() {
         let interrupt: [String: Any] = ["timestamp": "2026-10-07T09:00:00Z", "type": "user",
@@ -230,6 +252,47 @@ final class StatusTests {
                                     screen: screen, width: 280, squeeze: true)
         XCTAssertNil(place.window)
         XCTAssertEqual(place.panel, CGRect(x: 1640, y: 25, width: 280, height: 800))
+    }
+    func testAdjacentWindowsReserveTheirOwnSidebarSpace() {
+        let footprints = [CGRect(x: 0, y: 25, width: 960, height: 1055),
+                          CGRect(x: 960, y: 25, width: 960, height: 1055)]
+        let places = footprints.map {
+            Placement.place(window: $0, fullScreen: false, screen: screen, width: 280,
+                            squeeze: true, reserveInside: true)
+        }
+        for (footprint, place) in zip(footprints, places) {
+            XCTAssertEqual(place.window?.width, 680)
+            XCTAssertEqual(place.window?.minX, footprint.minX)
+            XCTAssertEqual(place.window?.maxX, place.panel.minX)
+            XCTAssertEqual(place.panel.maxX, footprint.maxX)
+            XCTAssertTrue(footprint.contains(place.panel))
+        }
+        XCTAssertTrue(!places[0].panel.intersects(places[1].window!))
+        XCTAssertTrue(!places[1].panel.intersects(places[0].window!))
+        XCTAssertTrue(!places[0].panel.intersects(places[1].panel))
+    }
+    func testReservationFitsOnNegativeCoordinateDisplay() {
+        let display = CGRect(x: -1920, y: -1055, width: 1920, height: 1055)
+        let footprint = CGRect(x: -1920, y: -1055, width: 960, height: 1055)
+        let place = Placement.place(window: footprint, fullScreen: false, screen: display, width: 280,
+                                    squeeze: true, reserveInside: true)
+        XCTAssertEqual(place.window, CGRect(x: -1920, y: -1055, width: 680, height: 1055))
+        XCTAssertEqual(place.panel, CGRect(x: -1240, y: -1055, width: 280, height: 1055))
+    }
+    func testNarrowReservationStaysInsideItsWindow() {
+        let footprint = CGRect(x: 0, y: 25, width: 420, height: 800)
+        let place = Placement.place(window: footprint, fullScreen: false, screen: screen, width: 280,
+                                    squeeze: true, reserveInside: true)
+        XCTAssertNil(place.window)
+        XCTAssertTrue(footprint.contains(place.panel))
+    }
+    func testOversizedSidebarStaysInsideItsWindow() {
+        let footprint = CGRect(x: 0, y: 25, width: 420, height: 800)
+        let place = Placement.place(window: footprint, fullScreen: false, screen: screen, width: 600,
+                                    squeeze: true, reserveInside: true)
+        XCTAssertNil(place.window)
+        XCTAssertTrue(footprint.contains(place.panel))
+        XCTAssertEqual(place.panel.width, 420)
     }
     func testFullScreenWindowGetsOverlay() {
         let window = CGRect(x: 0, y: 0, width: 1920, height: 1080)

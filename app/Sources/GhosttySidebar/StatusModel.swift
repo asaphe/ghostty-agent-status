@@ -16,6 +16,15 @@ struct SessionStatus: Codable, Identifiable, Equatable {
 
     var id: String { "\(agent)-\(sessionId)" }
 
+    var displayState: String {
+        guard state == "idle", let message else { return state }
+        let words = message.split(separator: " ")
+        guard words.count == 4, let count = Int(words[0]), count > 0,
+              words[1] == "background", words[2] == (count == 1 ? "task" : "tasks"),
+              words[3] == "running" else { return state }
+        return "background"
+    }
+
     var rank: Int {
         switch state {
         case "waiting": return 0

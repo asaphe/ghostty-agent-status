@@ -8,7 +8,17 @@ app="${HOME}/Applications/Ghostty Sidebar.app"
 swift build -c release --package-path "$here"
 bin="$(swift build -c release --package-path "$here" --show-bin-path)/GhosttySidebar"
 
-pkill -x GhosttySidebar 2>/dev/null || true
+if pgrep -x GhosttySidebar >/dev/null; then
+  osascript -e 'tell application id "io.github.asaphe.ghostty-agent-status" to quit'
+  for attempt in {1..50}; do
+    if ! pgrep -x GhosttySidebar >/dev/null; then break; fi
+    sleep 0.1
+  done
+  if pgrep -x GhosttySidebar >/dev/null; then
+    echo "Ghostty Sidebar did not quit; leaving the installed app intact." >&2
+    exit 1
+  fi
+fi
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/GhosttySidebar"

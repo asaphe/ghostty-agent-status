@@ -8,3 +8,9 @@ swiftc "$here/Sources/GhosttySidebar/StatusModel.swift" \
   "$here/Sources/GhosttySidebar/Placement.swift" \
   "$here/Tests/GhosttySidebarTests/StatusTests.swift" -o "$scratch/status-tests"
 "$scratch/status-tests"
+swiftc "$here/Sources/GhosttySidebar/PanelBehavior.swift" \
+  "$here/Tests/GhosttySidebarTests/PanelTests.swift" -o "$scratch/panel-tests"
+"$scratch/panel-tests"
+swiftc -D SIDEBAR_TESTS -parse-as-library "$here"/Sources/GhosttySidebar/*.swift \
+  "$here/Tests/GhosttySidebarTests/LifecycleTests.swift" -o "$scratch/lifecycle-tests"
+"$scratch/lifecycle-tests"
