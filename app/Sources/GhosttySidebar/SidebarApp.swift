@@ -6,6 +6,7 @@ let panelWidth: CGFloat = 280
 let traceURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/GhosttySidebar.log")
 
 func trace(_ message: String) {
+    #if !SIDEBAR_TESTS
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
     if let handle = try? FileHandle(forWritingTo: traceURL) {
         handle.seekToEndOfFile()
@@ -14,6 +15,7 @@ func trace(_ message: String) {
     } else {
         try? Data(line.utf8).write(to: traceURL)
     }
+    #endif
 }
 
 @MainActor
@@ -163,20 +165,23 @@ enum Ghostty {
         NSAppleScript(source: "tell application \"Ghostty\" to focus (terminal id \"\(id)\")")?.executeAndReturnError(&error)
         if let error {
             trace("ghostty focus failed: \(error)")
-            NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first?.activate()
         }
+        NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first?.activate()
     }
 
     // The window server reports a window's frame live during a drag; Accessibility only catches up afterwards.
-    static func onScreenWindows() -> [(id: CGWindowID, frame: CGRect)] {
-        guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first?.processIdentifier,
-              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    static func onScreenWindows() -> [(id: CGWindowID, frame: CGRect)]? {
+        guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first?.processIdentifier
         else { return [] }
-        return list.compactMap { info in
-            guard info[kCGWindowOwnerPID as String] as? pid_t == pid, info[kCGWindowLayer as String] as? Int == 0,
-                  let id = info[kCGWindowNumber as String] as? CGWindowID, let frame = cgFrame(info) else { return nil }
-            return (id, frame)
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return nil }
+        var result: [(id: CGWindowID, frame: CGRect)] = []
+        for info in list where info[kCGWindowOwnerPID as String] as? pid_t == pid
+            && info[kCGWindowLayer as String] as? Int == 0 {
+            guard let id = info[kCGWindowNumber as String] as? CGWindowID, let frame = cgFrame(info) else { return nil }
+            result.append((id, frame))
         }
+        return result
     }
 
     static func liveFrame(_ id: CGWindowID) -> CGRect? {
@@ -185,14 +190,16 @@ enum Ghostty {
         return cgFrame(info)
     }
 
-    // Whether another app's window, or another Ghostty window, stacked above `id` overlaps `rect`.
+    // Covered panels yield instead of obscuring another window's content.
     static func covered(above id: CGWindowID, _ rect: CGRect) -> Bool {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], id) as? [[String: Any]]
         else { return false }
         let own = getpid()
         return list.contains { info in
-            info[kCGWindowOwnerPID as String] as? pid_t != own && info[kCGWindowLayer as String] as? Int == 0
-                && (info[kCGWindowAlpha as String] as? Double ?? 1) > 0 && cgFrame(info)?.intersects(rect) == true
+            PanelCoverage.blocks(owner: info[kCGWindowOwnerPID as String] as? pid_t,
+                                 layer: info[kCGWindowLayer as String] as? Int,
+                                 alpha: info[kCGWindowAlpha as String] as? Double ?? 1,
+                                 frame: cgFrame(info), sidebar: rect, ownPID: own)
         }
     }
 
@@ -213,15 +220,25 @@ enum Ghostty {
         let liveID: CGWindowID?
     }
 
-    // Front-to-back. Hidden native tabs share their group's frame but are off screen, so each frame is kept as many
-    // times as the window server shows an on-screen Ghostty window there. Both lists run front-to-back, so the n-th
-    // window with a given frame pairs with the n-th on-screen one, which keeps same-frame windows apart.
-    static func windows() -> [Window] {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first else { return [] }
+    struct WindowInventory {
+        let visible: [Window]
+        let elements: [AXUIElement]
+    }
+
+    static func windows() -> [Window]? { windowInventory()?.visible }
+
+    // Incomplete Accessibility scans must not release and recreate live sidebars.
+    static func windowInventory() -> WindowInventory? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).first
+        else { return WindowInventory(visible: [], elements: []) }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(axApp, 0.5)
-        guard let elements = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else { return [] }
-        var onScreen = onScreenWindows()
+        guard let elements = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement],
+              var onScreen = onScreenWindows() else {
+            trace("window scan unavailable; preserving layout")
+            return nil
+        }
+        let expected = onScreen.map(\.id)
         var result: [Window] = []
         for element in elements {
             AXUIElementSetMessagingTimeout(element, 0.5)
@@ -232,7 +249,11 @@ enum Ghostty {
             result.append(Window(element: element, frame: frame, title: attribute(element, kAXTitleAttribute) as? String ?? "",
                                  fullScreen: attribute(element, "AXFullScreen") as? Bool == true, liveID: live.id))
         }
-        return result
+        guard WindowScan.isComplete(expected: expected, matched: result.compactMap(\.liveID)) else {
+            trace("window scan incomplete: \(result.count)/\(expected.count); preserving layout")
+            return nil
+        }
+        return WindowInventory(visible: result, elements: elements)
     }
 
     // Accessibility and the window server can round the same frame differently.
@@ -240,9 +261,10 @@ enum Ghostty {
         abs(a.minX - b.minX) <= 1 && abs(a.minY - b.minY) <= 1 && abs(a.width - b.width) <= 1 && abs(a.height - b.height) <= 1
     }
 
-    static func window(_ element: AXUIElement) -> Window? {
+    static func window(_ element: AXUIElement, includingMinimized: Bool = false) -> Window? {
         AXUIElementSetMessagingTimeout(element, 0.5)
-        guard attribute(element, kAXMinimizedAttribute) as? Bool != true, let frame = axFrame(element) else { return nil }
+        guard includingMinimized || attribute(element, kAXMinimizedAttribute) as? Bool != true,
+              let frame = axFrame(element) else { return nil }
         return Window(element: element, frame: frame, title: attribute(element, kAXTitleAttribute) as? String ?? "",
                       fullScreen: attribute(element, "AXFullScreen") as? Bool == true, liveID: nil)
     }
@@ -291,6 +313,7 @@ struct StateBadge: View {
         switch state {
         case "waiting": return .orange
         case "working": return .green
+        case "background": return .blue
         case "idle": return .gray
         default: return .secondary
         }
@@ -315,7 +338,7 @@ struct SessionRow: View {
                 .frame(width: 4)
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    StateBadge(state: session.state)
+                    StateBadge(state: session.displayState)
                     Spacer()
                     Text(session.agent).font(.caption2).foregroundStyle(.secondary)
                 }
@@ -419,10 +442,6 @@ struct SidebarView: View {
     }
 }
 
-final class SidebarPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
 // A non-activating panel otherwise swallows the first click as "focus the window" and never delivers it.
 final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -449,10 +468,19 @@ final class SidebarController {
     private var requested: (target: CGRect, took: CGRect)?
     private var placed: NSRect?
     private var dragging = false
+    private let windowLookup: (AXUIElement, Bool) -> Ghostty.Window?
+    private let resizeWindow: (AXUIElement, CGRect) -> CGRect?
+    private let screens: () -> [CGRect]
     // Set from the paired `Ghostty.windows()` entry; a frame search alone can't tell same-frame windows apart.
     var liveWindowID: CGWindowID?
 
-    init(store: StatusStore, autosaveName: String?, onClose: @escaping () -> Void) {
+    init(store: StatusStore, autosaveName: String?, onClose: @escaping () -> Void,
+         windowLookup: @escaping (AXUIElement, Bool) -> Ghostty.Window? = { Ghostty.window($0, includingMinimized: $1) },
+         resizeWindow: @escaping (AXUIElement, CGRect) -> CGRect? = { Ghostty.setFrame($0, $1) },
+         screens: @escaping () -> [CGRect] = { Screens.visibleFrames }) {
+        self.windowLookup = windowLookup
+        self.resizeWindow = resizeWindow
+        self.screens = screens
         panel = SidebarPanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 600),
                              styleMask: [.titled, .resizable, .fullSizeContentView, .nonactivatingPanel, .utilityWindow],
                              backing: .buffered, defer: false)
@@ -478,7 +506,7 @@ final class SidebarController {
         if let window, let element, CFEqual(window, element) { return }
         release()
         window = element
-        windowFrame = element.flatMap { Ghostty.window($0)?.frame }
+        windowFrame = element.flatMap { windowLookup($0, false)?.frame }
         liveWindowID = nil
         placed = nil
     }
@@ -490,9 +518,9 @@ final class SidebarController {
 
     // Gives the window back the width it had before the sidebar squeezed it, unless someone resized it since.
     func release() {
-        if let window, let squeezed, var frame = Ghostty.window(window)?.frame, frame.width == squeezed.appliedWidth {
+        if let window, let squeezed, var frame = windowLookup(window, true)?.frame, frame.width == squeezed.appliedWidth {
             frame.size.width = squeezed.originalWidth
-            Ghostty.setFrame(window, frame)
+            _ = resizeWindow(window, frame)
             trace("released window -> \(frame)")
         }
         squeezed = nil
@@ -515,32 +543,40 @@ final class SidebarController {
     }
 
     // Returns the followed window, or nil once it is gone.
-    func follow(squeeze: Bool, allowDrop: Bool) -> Ghostty.Window? {
+    func follow(squeeze: Bool, allowDrop: Bool, reserveInside: Bool = false,
+                observed: Ghostty.Window? = nil) -> Ghostty.Window? {
         let mouseDown = NSEvent.pressedMouseButtons != 0
         if let placed, panel.frame != placed, mouseDown { dragging = true }
         // Mid-drag the Accessibility frame lags; `track` moves the panel until the button is released.
-        if mouseDown { return window.flatMap(Ghostty.window) }
+        if mouseDown { return window.flatMap { windowLookup($0, false) } }
         if dragging {
             dragging = false
             placed = nil
             if allowDrop {
-                let candidates = Ghostty.windows()
-                if let i = Placement.dropTarget(panel: Screens.flip(panel.frame), windows: candidates.map(\.frame)) {
+                if let candidates = Ghostty.windows(),
+                   let i = Placement.dropTarget(panel: Screens.flip(panel.frame), windows: candidates.map(\.frame)) {
                     attach(candidates[i].element)
                     trace("attached by drop: \(candidates[i].title)")
                 }
             }
         }
-        guard let element = window, let current = Ghostty.window(element) else { return nil }
-        guard let screen = Placement.screen(for: current.frame, among: Screens.visibleFrames) else { return current }
+        guard let element = window else { return nil }
+        let matching = observed.flatMap { CFEqual(element, $0.element) ? $0 : nil }
+        guard let current = matching ?? windowLookup(element, false) else { return nil }
+        guard let screen = Placement.screen(for: current.frame, among: screens()) else { return current }
         let width = panel.frame.width
-        let place = Placement.place(window: current.frame, fullScreen: current.fullScreen, screen: screen, width: width, squeeze: squeeze)
+        var footprint = current.frame
+        if reserveInside, let squeezed, footprint.width == squeezed.appliedWidth {
+            footprint.size.width = squeezed.originalWidth
+        }
+        let place = Placement.place(window: footprint, fullScreen: current.fullScreen, screen: screen,
+                                    width: width, squeeze: squeeze, reserveInside: reserveInside)
         var frame = current.frame
         if !squeeze, squeezed != nil {
             release()
-            frame = Ghostty.window(element)?.frame ?? frame
+            frame = windowLookup(element, false)?.frame ?? frame
         } else if let target = place.window, target != frame, requested.map({ $0 != (target, frame) }) ?? true,
-                  let took = Ghostty.setFrame(element, target) {
+                  let took = resizeWindow(element, target) {
             requested = (target, took)
             let original = squeezed.map { $0.appliedWidth == frame.width ? $0.originalWidth : frame.width } ?? frame.width
             squeezed = (originalWidth: original, appliedWidth: took.width)
@@ -548,10 +584,13 @@ final class SidebarController {
             frame = took
         }
         var rect = place.panel
-        if squeezed?.appliedWidth == frame.width { rect.origin.x = min(frame.maxX, screen.maxX - width) }
+        if place.window != nil, squeezed?.appliedWidth == frame.width {
+            rect.origin.x = min(frame.maxX, screen.maxX - rect.width)
+        }
         windowFrame = frame
-        if liveWindowID.flatMap(Ghostty.liveFrame) == nil {
-            liveWindowID = Ghostty.onScreenWindows().first { Ghostty.sameFrame($0.frame, frame) }?.id
+        if liveWindowID == nil,
+           let match = Ghostty.onScreenWindows()?.first(where: { Ghostty.sameFrame($0.frame, frame) }) {
+            liveWindowID = match.id
         }
         let target = Screens.flip(rect)
         if panel.frame != target { panel.setFrame(target, display: true) }
@@ -559,8 +598,7 @@ final class SidebarController {
         return current
     }
 
-    // Shown only while nothing stacked above its Ghostty window covers the spot, so each display behaves on its own.
-    // `blocked`: a sidebar of a Ghostty window higher in the stack already shows where this one would.
+    // Overlapping sidebars share the spot with the frontmost attached window.
     func updateVisibility(enabled: Bool, blocked: Bool) {
         if !enabled { dragging = false }
         let rect = Screens.flip(panel.frame)
@@ -577,7 +615,7 @@ final class SidebarController {
     func track() {
         if let placed, panel.frame != placed { dragging = true }
         guard !dragging, let id = liveWindowID, let frame = Ghostty.liveFrame(id), frame != windowFrame,
-              let screen = Placement.screen(for: frame, among: Screens.visibleFrames) else { return }
+              let screen = Placement.screen(for: frame, among: screens()) else { return }
         let width = panel.frame.width
         var rect = Placement.place(window: frame, fullScreen: false, screen: screen, width: width, squeeze: false).panel
         if squeezed?.appliedWidth == frame.width { rect.origin.x = min(frame.maxX, screen.maxX - width) }
@@ -603,6 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dragTimer: Timer?
     private var trusted = false
     private var ticks = 0
+    private var windowOrder: [CGWindowID] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -659,8 +698,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggle() { setEnabled(!enabled) }
 
     @objc private func attachToFront() {
-        guard requestTrust("attach to front window"), let single = controllers.first, !perWindow else { return }
-        single.attach(Ghostty.windows().first?.element)
+        guard requestTrust("attach to front window"), let single = controllers.first, !perWindow,
+              let windows = Ghostty.windows() else { return }
+        single.attach(windows.first?.element)
     }
 
     @objc private func togglePerWindow() {
@@ -711,12 +751,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        let windows = enabled ? Ghostty.windows() : []
-        if enabled {
-            if perWindow { syncPerWindow(windows) } else if let single = controllers.first { followSingle(single, windows) }
+        reconcile(enabled ? Ghostty.windowInventory() : Ghostty.WindowInventory(visible: [], elements: []))
+    }
+
+    private func reconcile(_ inventory: Ghostty.WindowInventory?) {
+        if let inventory {
+            let windows = inventory.visible
+            windowOrder = windows.compactMap(\.liveID)
+            if enabled {
+                if perWindow { syncPerWindow(windows, elements: inventory.elements) }
+                else if let single = controllers.first { followSingle(single, windows) }
+            }
         }
         func rank(_ c: SidebarController) -> Int {
-            windows.firstIndex { w in c.window.map { CFEqual($0, w.element) } ?? false } ?? Int.max
+            c.liveWindowID.flatMap { windowOrder.firstIndex(of: $0) } ?? Int.max
         }
         var shown: [NSRect] = []
         for c in controllers.sorted(by: { rank($0) < rank($1) }) {
@@ -729,7 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // The window with the most live sessions; ties go to the frontmost.
     private func busiestWindow() -> AXUIElement? {
         let counts = Dictionary(store.groups.map { ($0.id, $0.sessions.count) }, uniquingKeysWith: +)
-        let windows = Ghostty.windows()
+        guard let windows = Ghostty.windows() else { return nil }
         let scores = windows.map { w in store.windowId(titled: w.title).flatMap { counts[$0] } ?? 0 }
         guard let best = scores.indices.max(by: { (scores[$0], -$0) < (scores[$1], -$1) }) else { return nil }
         return windows[best].element
@@ -743,22 +791,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard i < windows.count else { return }
             single.attach(windows[i].element)
         }
-        if let w = windows.first(where: { w in single.window.map { CFEqual($0, w.element) } ?? false }) {
+        let observed = windows.first { w in
+            (single.liveWindowID != nil && single.liveWindowID == w.liveID)
+                || (single.window.map { CFEqual($0, w.element) } ?? false)
+        }
+        if let w = observed {
+            single.adopt(w.element)
             single.liveWindowID = w.liveID
         }
-        if single.follow(squeeze: keepClear, allowDrop: true) == nil {
+        if single.follow(squeeze: keepClear, allowDrop: true, observed: observed) == nil {
             single.attach(busiestWindow())
             trace("attached window closed; moved to busiest window")
         }
     }
 
-    private func syncPerWindow(_ windows: [Ghostty.Window]) {
+    private func syncPerWindow(_ windows: [Ghostty.Window], elements: [AXUIElement]) {
         var unclaimed = windows
+        var matched: [ObjectIdentifier: Ghostty.Window] = [:]
+        for c in controllers {
+            let match = unclaimed.firstIndex { c.liveWindowID != nil && c.liveWindowID == $0.liveID }
+                ?? unclaimed.firstIndex { w in c.window.map { CFEqual($0, w.element) } == true }
+            if let match { matched[ObjectIdentifier(c)] = unclaimed.remove(at: match) }
+        }
+        for c in controllers where matched[ObjectIdentifier(c)] == nil {
+            if let window = c.window, elements.contains(where: { CFEqual(window, $0) }) { continue }
+            if let match = unclaimed.firstIndex(where: { w in c.windowFrame.map { Ghostty.sameFrame(w.frame, $0) } == true }) {
+                matched[ObjectIdentifier(c)] = unclaimed.remove(at: match)
+            }
+        }
         controllers.removeAll { c in
-            let match = unclaimed.firstIndex { w in c.window.map { CFEqual($0, w.element) } == true }
-                ?? unclaimed.firstIndex { $0.frame == c.windowFrame }
-            guard let match else { c.close(); return true }
-            let w = unclaimed.remove(at: match)
+            guard let w = matched[ObjectIdentifier(c)] else {
+                if let window = c.window, elements.contains(where: { CFEqual(window, $0) }) { return false }
+                c.close()
+                return true
+            }
             c.adopt(w.element)
             c.liveWindowID = w.liveID
             return false
@@ -774,7 +840,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for c in controllers {
             let isFront = c.window.map { w in front.map { CFEqual(w, $0) } ?? false } ?? false
             if c.filter.showsUnplaced != isFront { c.filter.showsUnplaced = isFront }
-            guard let current = c.follow(squeeze: keepClear, allowDrop: false) else { continue }
+            guard let observed = windows.first(where: { $0.liveID == c.liveWindowID }),
+                  let current = c.follow(squeeze: keepClear, allowDrop: false, reserveInside: true,
+                                         observed: observed) else { continue }
             if let id = store.windowId(titled: current.title) {
                 c.filter.set(.window(id))
                 c.filter.misses = 0
@@ -784,34 +852,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    #if SIDEBAR_TESTS
+    func reconcileForTesting(_ inventory: Ghostty.WindowInventory?, controllers: [SidebarController]) -> [SidebarController] {
+        self.controllers = controllers
+        enabled = true
+        keepClear = true
+        perWindow = true
+        reconcile(inventory)
+        return self.controllers
+    }
+    #endif
 }
 
-if CommandLine.arguments.contains("--snapshot") {
-    guard let layout = Ghostty.tabLayout() else {
-        fputs("Ghostty lookup failed\n", stderr)
-        exit(1)
+#if !SIDEBAR_TESTS
+@main
+struct SidebarApp {
+    @MainActor
+    static func main() throws {
+        if CommandLine.arguments.contains("--snapshot") {
+            guard let layout = Ghostty.tabLayout() else {
+                fputs("Ghostty lookup failed\n", stderr)
+                exit(1)
+            }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let urls = (try? FileManager.default.contentsOfDirectory(at: statusDirectory(), includingPropertiesForKeys: nil)) ?? []
+            let records = urls.filter { $0.pathExtension == "json" }.compactMap {
+                try? decoder.decode(SessionStatus.self, from: Data(contentsOf: $0))
+            }
+            let reader = EvidenceReader()
+            reader.refreshIndex()
+            let rows = Reconcile.sessions(records, layout: layout, names: reader.codexNames,
+                                          evidence: { reader.evidence(agent: $0, id: $1) })
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            print(String(data: try encoder.encode(rows.sorted { $0.id < $1.id }), encoding: .utf8)!)
+        } else {
+            let app = NSApplication.shared
+            let delegate = AppDelegate()
+            app.delegate = delegate
+            app.setActivationPolicy(.accessory)
+            app.run()
+        }
     }
-    let decoder = JSONDecoder()
-    decoder.keyDecodingStrategy = .convertFromSnakeCase
-    let urls = (try? FileManager.default.contentsOfDirectory(at: statusDirectory(), includingPropertiesForKeys: nil)) ?? []
-    let records = urls.filter { $0.pathExtension == "json" }.compactMap {
-        try? decoder.decode(SessionStatus.self, from: Data(contentsOf: $0))
-    }
-    let reader = EvidenceReader()
-    reader.refreshIndex()
-    let rows = Reconcile.sessions(records, layout: layout, names: reader.codexNames,
-                                  evidence: { reader.evidence(agent: $0, id: $1) })
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    encoder.keyEncodingStrategy = .convertToSnakeCase
-    print(String(data: try encoder.encode(rows.sorted { $0.id < $1.id }), encoding: .utf8)!)
-} else {
-MainActor.assumeIsolated {
-    let app = NSApplication.shared
-    let delegate = AppDelegate()
-    app.delegate = delegate
-    app.setActivationPolicy(.accessory)
-    app.run()
 }
-
-}
+#endif

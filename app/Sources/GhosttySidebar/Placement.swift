@@ -9,13 +9,23 @@ struct PanelPlacement: Equatable {
 enum Placement {
     static let minimumWindowWidth: CGFloat = 300
 
-    static func place(window: CGRect, fullScreen: Bool, screen: CGRect, width: CGFloat, squeeze: Bool) -> PanelPlacement {
+    static func place(window: CGRect, fullScreen: Bool, screen: CGRect, width: CGFloat, squeeze: Bool,
+                      reserveInside: Bool = false) -> PanelPlacement {
         if fullScreen {
             return PanelPlacement(panel: CGRect(x: window.maxX - width, y: window.minY, width: width, height: window.height))
         }
         let top = max(window.minY, screen.minY)
         let height = max(min(window.maxY, screen.maxY) - top, 200)
-        func panel(at x: CGFloat) -> CGRect { CGRect(x: x, y: top, width: width, height: height) }
+        let effectiveWidth = squeeze && reserveInside ? min(width, window.width) : width
+        func panel(at x: CGFloat) -> CGRect { CGRect(x: x, y: top, width: effectiveWidth, height: height) }
+        if squeeze && reserveInside {
+            var squeezed = window
+            squeezed.size.width = min(window.maxX, screen.maxX) - effectiveWidth - window.minX
+            if squeezed.width >= minimumWindowWidth {
+                return PanelPlacement(panel: panel(at: squeezed.maxX), window: squeezed)
+            }
+            return PanelPlacement(panel: panel(at: max(window.minX, min(window.maxX, screen.maxX) - effectiveWidth)))
+        }
         if window.maxX + width <= screen.maxX {
             return PanelPlacement(panel: panel(at: window.maxX))
         }

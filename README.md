@@ -47,6 +47,8 @@ Updating, uninstalling and troubleshooting: [SETUP.md](SETUP.md#updating).
 
 ## How the state is decided
 
+The sidebar keeps keyboard focus in Ghostty. With **One Sidebar per Window** and **Keep Ghostty Windows Beside Sidebar** enabled, each terminal shrinks to reserve sidebar space inside its original window footprint, keeping adjacent windows clear. An idle turn with running background tasks shows a blue **background** badge and the task count; its hook state remains `idle`.
+
 | Signal | State |
 |---|---|
 | `UserPromptSubmit`, the main agent's tool events | working |
