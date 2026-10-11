@@ -4,7 +4,7 @@ See at a glance which of your Claude Code and Codex sessions are **working**, **
 
 Two parts, usable separately:
 
-- **The plugin (hooks).** Every session event updates a small status file and the tab's title: ⏳ working, ✋ waiting for you, 💤 idle, 🏁 done. A colored square marks the repo and branch. This alone makes Ghostty's tab bar a status board.
+- **The plugin (hooks).** Every session event updates a small status file and the tab's title: ⏳ working, ✋ waiting for you, 🔄 background work, 💤 idle, 🏁 done. A colored square marks the repo and branch. This alone makes Ghostty's tab bar a status board.
 - **The sidebar app.** A floating "Session Status" panel listing sessions in tab order, with a divider between windows, shown while Ghostty is in front. Click a row to jump to its tab. The panel attaches to one Ghostty window and follows it when it moves; drag the panel onto another window (on any display) to attach it there, and it moves to the window with the most sessions when its window closes or when **One Sidebar per Window** is turned off. **One Sidebar per Window** gives each window its own panel, listing only that window's tabs.
 
 Requirements: macOS 14+, [Ghostty](https://ghostty.org) 1.3+ (it uses Ghostty's AppleScript support), Python 3.9+ (the macOS system Python is fine). The app also needs Xcode's command-line tools to build.
@@ -55,6 +55,8 @@ Updating, uninstalling and troubleshooting: [SETUP.md](SETUP.md#updating).
 | `SessionEnd` | done |
 
 **Claude Code fires no hook when you deny a permission, press Esc, or decline a plan.** The sidebar ends those turns from the session transcript instead: the `[Request interrupted by user` row or the `turn_duration` row that Claude Code writes. Tab titles still show the last hook state until the next event. Codex records interrupts as `turn_aborted` in its rollout, which the sidebar reads the same way.
+
+When a stopped turn reports running background tasks, its tab shows 🔄 instead of 💤. The stored turn state remains `idle`; `SubagentStop` refreshes the task count without ending an active parent turn. Counts follow those hook snapshots; shell or monitor completion without a new snapshot can retain its indicator until a new Stop/SubagentStop snapshot or main-turn activity. Bash permission requests ignore their approval-only description when matching completion events, so a completed request does not leave the session waiting.
 
 Subagent and hook-helper tool events carry an `agent_id` and never flip the main session's state; a subagent's permission prompt still shows as waiting, because it waits for you. Codex threads that have no tab of their own (`codex exec`, IDE threads, subagents) are not tracked.
 

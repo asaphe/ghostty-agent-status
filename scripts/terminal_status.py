@@ -52,7 +52,7 @@ WORK_DIR = STATE_DIR / "work"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 
-STATE_GLYPH = {"working": "⏳", "waiting": "✋", "idle": "💤", "done": "🏁"}
+STATE_GLYPH = {"working": "⏳", "waiting": "✋", "background": "🔄", "idle": "💤", "done": "🏁"}
 COLOR_GLYPHS = ((0, "🟥"), (30, "🟧"), (55, "🟨"), (120, "🟩"), (215, "🟦"), (280, "🟪"))
 OUR_PREFIX = re.compile("^[" + "".join(STATE_GLYPH.values()) + "][" + "".join(g for _, g in COLOR_GLYPHS) + "]? ")
 BELL = "🔔 "
@@ -70,6 +70,19 @@ MESSAGE_MAX = 120
 PRUNE_AFTER_SECONDS = 24 * 3600
 
 
+def background_message(payload: dict) -> str | None:
+    running = [t for t in payload.get("background_tasks") or [] if t.get("status") == "running"]
+    return f"{len(running)} background task{'s' * (len(running) != 1)} running" if running else None
+
+
+def display_state(record: dict) -> str:
+    state = record.get("state") or "idle"
+    background = re.fullmatch(r"([1-9]\d*) background (tasks?) running", record.get("message") or "")
+    if state == "idle" and background and background[2] == ("task" if background[1] == "1" else "tasks"):
+        return "background"
+    return state
+
+
 def state_for(payload: dict) -> tuple[str, str | None] | None:
     """(state, message) for a hook event, or None when the event says nothing about the state."""
     event = payload.get("hook_event_name")
@@ -78,8 +91,7 @@ def state_for(payload: dict) -> tuple[str, str | None] | None:
     if event == "SessionStart":
         return "idle", None
     if event == "Stop":
-        running = [t for t in payload.get("background_tasks") or [] if t.get("status") == "running"]
-        return "idle", f"{len(running)} background task{'s' * (len(running) != 1)} running" if running else None
+        return "idle", background_message(payload)
     if event == "StopFailure":
         return "idle", "turn failed"
     if event == "SessionEnd":
@@ -108,7 +120,11 @@ def call_key(payload: dict) -> str:
     tool = payload.get("tool_name")
     if not tool:
         return "permission"
-    body = json.dumps(payload.get("tool_input"), sort_keys=True, default=str)
+    tool_input = payload.get("tool_input")
+    # Codex adds description only to Bash permission requests, not their completion events.
+    if tool == "Bash" and isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str):
+        tool_input = {k: v for k, v in tool_input.items() if k != "description"}
+    body = json.dumps(tool_input, sort_keys=True, default=str)
     return f"{tool}:{hashlib.sha1(body.encode()).hexdigest()[:12]}"
 
 
@@ -119,6 +135,7 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
     tracking.setdefault("main_state", old.get("state") if old.get("state") in {"working", "idle", "done"} else "idle")
     pending = tracking.setdefault("pending", {})
     before_pending = dict(pending)
+    before_message = tracking.get("main_message")
     change = state_for(payload)
     if change is None and event not in {"SubagentStop", "PostToolUse", "PostToolUseFailure"}:
         return None
@@ -132,6 +149,8 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
         for waiting in list(pending):
             if waiting.startswith(f"{actor}:"):
                 pending.pop(waiting)
+        if tracking["main_state"] == "idle" and "background_tasks" in payload:
+            tracking["main_message"] = background_message(payload)
     if event in {"UserPromptSubmit", "Stop", "StopFailure"}:
         for waiting in list(pending):
             if waiting.startswith("main:"):
@@ -144,10 +163,11 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
             pending[key] = change[1]
     elif change and actor == "main":
         tracking["main_state"] = change[0]
-        tracking["main_message"] = change[1]
+        if event != "Notification" or payload.get("notification_type") != "idle_prompt":
+            tracking["main_message"] = change[1]
     if pending:
         return "waiting", next(reversed(pending.values()))
-    if change is None and pending == before_pending:
+    if change is None and pending == before_pending and tracking.get("main_message") == before_message:
         return None
     return tracking.get("main_state", old.get("state", "idle")), tracking.get("main_message")
 
@@ -469,7 +489,8 @@ def update(agent: str, payload: dict) -> None:
             record["title"] = codex_thread_name(session_id) or record["title"]
         write_status(record)
         _write_json(tracking_path, tracking)
-    if (event in RETITLE_EVENTS or state != old.get("state") or not record.get("ghostty_terminal_id")
+    if (event in RETITLE_EVENTS or state != old.get("state") or display_state(record) != display_state(old)
+            or not record.get("ghostty_terminal_id")
             or record.get("color") != old.get("color")):
         spawn_worker(agent, session_id, event)
 
@@ -533,7 +554,7 @@ def show(terminal_id: str) -> None:
         base = labels.get("label") or record.get("title") or record.get("repo") or agent
         if labels.get("milestone"):
             base = f"{base} · {labels['milestone']}"
-        wanted = compose(record.get("state") or "idle", record.get("color"), base)
+        wanted = compose(display_state(record), record.get("color"), base)
         shown = terminal.tab_title.removeprefix(BELL)
         if wanted != shown:
             ghostty_tabs.set_tab_title(terminal_id, wanted)

@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -26,6 +27,10 @@ class TtyProbeTests(unittest.TestCase):
         self.titles = {"/dev/ttys001": "claude", "/dev/ttys002": "codex"}
         self.ids = {"/dev/ttys001": "T1", "/dev/ttys002": "T2"}
         self.writes = []
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        open_lock = g.os.open
+        patch.object(g.os, "open", side_effect=lambda path, *args: open_lock(str(Path(scratch.name) / "probe.lock"), *args)).start()
         patch.object(g.time, "sleep").start()
         self.addCleanup(patch.stopall)
 
