@@ -15,7 +15,9 @@ overwrite each other.
 
 A hook resolves its terminal once per agent process and caches it in the status
 file. Claude's hooks share the agent's process tree, so its tty names the
-terminal. Codex runs hooks in a shared app-server daemon whose environment
+terminal. A backgrounded Claude session runs under Claude's daemon on a pty of
+its own, so its terminal is the interactive Claude process that has the job
+parked, found in Claude's per-process session registry. Codex runs hooks in a shared app-server daemon whose environment
 belongs to whichever tab started it, so the terminal is the Ghostty Codex TUI
 that resumed the thread, else the only one that took input just now, else the
 only unclaimed one in the session's directory; anything else stays unresolved.
@@ -51,6 +53,7 @@ STATUS_DIR = STATE_DIR / "status"
 WORK_DIR = STATE_DIR / "work"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
+CLAUDE_SESSIONS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "sessions"
 
 STATE_GLYPH = {"working": "⏳", "waiting": "✋", "background": "🔄", "idle": "💤", "done": "🏁"}
 COLOR_GLYPHS = ((0, "🟥"), (30, "🟧"), (55, "🟨"), (120, "🟩"), (215, "🟦"), (280, "🟪"))
@@ -332,6 +335,27 @@ def pid_alive(pid) -> bool:
     return True
 
 
+def in_background_job() -> bool:
+    return os.environ.get("CLAUDE_CODE_SESSION_KIND") == "bg"
+
+
+def parked_host(session_id: str) -> int | None:
+    """The live Claude process in Ghostty that has this background session's job parked, or None."""
+    records = [r for r in (_read_json(p) for p in CLAUDE_SESSIONS.glob("*.json")) if r]
+    job = next((r.get("jobId") for r in records if r.get("sessionId") == session_id and r.get("kind") == "bg"), None)
+    if not job:
+        return None
+    hosts = [r["pid"] for r in records
+             if r.get("parkedJobId") == job and r.get("kind") != "bg" and pid_alive(r.get("pid"))]
+    return hosts[0] if len(hosts) == 1 and runs_in_ghostty(hosts[0]) else None
+
+
+def runs_in_ghostty(pid: int) -> bool:
+    env = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                         check=False).stdout
+    return " TERM_PROGRAM=ghostty" in env
+
+
 def is_codex_app_server(command: str) -> bool:
     words = command.split()
     return len(words) > 1 and Path(words[0]).name == "codex" and words[1] == "app-server"
@@ -465,7 +489,14 @@ def update(agent: str, payload: dict) -> None:
             return
         state, message = change
         record = dict(old)
-        if not pid_alive(old.get("pid")):
+        if agent == "claude" and in_background_job():
+            host = parked_host(session_id)
+            if host is None:
+                _write_json(tracking_path, tracking)
+                return
+            if host != old.get("pid"):
+                record.update(pid=host, ghostty_terminal_id=None)
+        elif not pid_alive(old.get("pid")):
             owner = process_owner()
             if owner is None:
                 return
