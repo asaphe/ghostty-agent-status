@@ -362,6 +362,46 @@ class StatusFileTests(unittest.TestCase):
         self.assertEqual(self.run_hook("UserPromptSubmit", env="iTerm.app"), {})
         self.assertEqual(self.spawned, [])
 
+    def run_background_hook(self, event, sessions, in_ghostty=True):
+        registry = Path(self.tmp.name) / "sessions"
+        registry.mkdir(exist_ok=True)
+        for old in registry.glob("*.json"):
+            old.unlink()
+        for record in sessions:
+            (registry / f"{record['pid']}.json").write_text(json.dumps(record))
+        payload = {"session_id": "sid-1", "hook_event_name": event, "cwd": str(Path(__file__).parent)}
+        with patch.dict(os.environ, {"TERM_PROGRAM": "", "CLAUDE_CODE_SESSION_KIND": "bg"}), \
+                patch.object(s, "CLAUDE_SESSIONS", registry), \
+                patch.object(s, "runs_in_ghostty", return_value=in_ghostty), \
+                patch.object(s, "process_owner", side_effect=AssertionError("a background job has no tab tty")):
+            s.update("claude", payload)
+        return s.read_status("claude", "sid-1")
+
+    def test_a_background_job_reports_through_the_tab_that_parked_it(self):
+        bg = {"pid": 999999, "sessionId": "sid-1", "kind": "bg", "jobId": "sid1job"}
+        host = {"pid": os.getpid(), "sessionId": "sid-0", "kind": "interactive", "parkedJobId": "sid1job"}
+        record = self.run_background_hook("PreToolUse", [bg, host])
+        self.assertEqual((record["state"], record["pid"]), ("working", os.getpid()))
+        self.assertEqual(self.run_background_hook("PermissionRequest", [bg, host])["state"], "waiting")
+
+    def test_a_background_job_without_a_ghostty_host_gets_no_status_file(self):
+        bg = {"pid": 999999, "sessionId": "sid-1", "kind": "bg", "jobId": "sid1job"}
+        host = {"pid": os.getpid(), "sessionId": "sid-0", "kind": "interactive", "parkedJobId": "sid1job"}
+        dead = {**host, "pid": 999998}
+        self.assertEqual(self.run_background_hook("PreToolUse", [bg]), {})
+        self.assertEqual(self.run_background_hook("PreToolUse", [bg, dead]), {})
+        self.assertEqual(self.run_background_hook("PreToolUse", [bg, host], in_ghostty=False), {})
+
+    def test_a_background_job_moved_to_another_tab_is_relocated(self):
+        bg = {"pid": 999999, "sessionId": "sid-1", "kind": "bg", "jobId": "sid1job"}
+        host = {"pid": os.getpid(), "sessionId": "sid-0", "kind": "interactive", "parkedJobId": "sid1job"}
+        self.run_background_hook("UserPromptSubmit", [bg, host])
+        record = s.read_status("claude", "sid-1")
+        record.update(pid=1, ghostty_terminal_id="T1")
+        s.write_status(record)
+        record = self.run_background_hook("PreToolUse", [bg, host])
+        self.assertEqual((record["pid"], record["ghostty_terminal_id"]), (os.getpid(), None))
+
     def test_session_end_is_done_and_kept(self):
         self.run_hook("UserPromptSubmit")
         self.assertEqual(self.run_hook("SessionEnd")["state"], "done")

@@ -3,7 +3,8 @@
 
 Never blocks and never prints: exits 0 always, and the Ghostty work runs in a detached worker.
 Codex runs hooks in a shared app-server daemon whose environment may belong to another
-terminal, so only Claude is gated on TERM_PROGRAM; terminal_status finds a Codex thread's tab itself.
+terminal, so only Claude is gated on TERM_PROGRAM; terminal_status finds a Codex thread's tab, and a
+backgrounded Claude session's (which runs under Claude's daemon, outside Ghostty), itself.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ def main() -> int:
         payload = json.loads(sys.stdin.buffer.read() or b"{}")
         if agent not in ("claude", "codex") or not isinstance(payload, dict):
             return 0
-        if agent == "claude" and os.environ.get("TERM_PROGRAM", "").casefold() != "ghostty":
+        if (agent == "claude" and os.environ.get("TERM_PROGRAM", "").casefold() != "ghostty"
+                and os.environ.get("CLAUDE_CODE_SESSION_KIND") != "bg"):
             return 0
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import terminal_status
