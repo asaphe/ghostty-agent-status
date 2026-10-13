@@ -64,7 +64,7 @@ Subagent and hook-helper tool events carry an `agent_id` and never flip the main
 
 ## Finding a session's tab
 
-Ghostty 1.3 gives a process no way to learn which terminal it runs in. The hook writes a one-off OSC 2 title to the agent's tty, reads all terminal titles over AppleScript, and restores the previous title. A tab the probe has not matched yet appears under **Tab not identified yet**, and clicking it only activates Ghostty.
+Ghostty 1.3 gives a process no way to learn which terminal it runs in. The hook writes a one-off OSC 2 title to the agent's tty, reads all terminal titles over AppleScript, and restores the previous title. A probe that misses is retried at most every five minutes, because probes share one lock. A tab the probe has not matched yet appears under **Tab not identified yet**, and clicking it only activates Ghostty.
 
 ## Status files
 

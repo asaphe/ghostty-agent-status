@@ -23,6 +23,8 @@ OSASCRIPT_TIMEOUT_SECONDS = 20
 PROBE_ROUNDS = 3
 PROBE_POLLS = 5
 PROBE_POLL_SECONDS = 0.1
+# Outlasts a full failed probe: PROBE_ROUNDS * PROBE_POLLS + 2 listings at ~2 s each under load.
+PROBE_LOCK_WAIT_SECONDS = 45
 FIELD = "\x1f"
 ROW = "\x1e"
 
@@ -246,7 +248,7 @@ def terminals_for_ttys(ttys: list[str]) -> dict[str, str]:
     path = f"/tmp/ghostty-title-probe-{os.getuid()}.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as lock:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + PROBE_LOCK_WAIT_SECONDS
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -468,10 +468,26 @@ class StatusFileTests(unittest.TestCase):
         record = s.read_status("codex", "sid-1")
         self.assertEqual((record["pid"], record["ghostty_terminal_id"]), (4242, None))
         with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys") as probe:
+            s.apply("codex", "sid-1", "PreToolUse")
+        probe.assert_not_called()
+        expired = __import__("time").time() - s.PROBE_BACKOFF_SECONDS - 1
+        os.utime(s.probe_miss_path("codex", "sid-1"), (expired, expired))
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
                 patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={"/dev/ttys042": "T9"}), \
                 patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
             s.apply("codex", "sid-1", "PreToolUse")
         self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
+
+    def test_recorded_terminal_is_this_session_only_while_its_process_owns_the_record(self):
+        s.write_status({"agent": "claude", "session_id": "sid-1", "pid": 4242, "ghostty_terminal_id": "T7"})
+        for env, expected in (({"CLAUDE_CODE_SESSION_ID": "sid-1", "CLAUDE_PID": "4242"}, "T7"),
+                              ({"CLAUDE_CODE_SESSION_ID": "sid-1", "CLAUDE_PID": "5151"}, None),
+                              ({"CLAUDE_CODE_SESSION_ID": "sid-2", "CLAUDE_PID": "4242"}, None)):
+            with patch.dict(os.environ, env):
+                self.assertEqual(s.recorded_terminal(), expected, env)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(s.recorded_terminal())
 
     def test_prune_removes_only_what_a_day_dead_session_left(self):
         old = __import__("time").time() - s.PRUNE_AFTER_SECONDS - 60
@@ -482,7 +498,10 @@ class StatusFileTests(unittest.TestCase):
             s._write_json(label, {"label": sid})
             with s.locked(f"claude-{sid}"):
                 pass
-            files[sid] = (s.status_path("claude", sid), label, s.WORK_DIR / "locks" / f"claude-{sid}.lock")
+            missed = s.probe_miss_path("claude", sid)
+            missed.parent.mkdir(parents=True, exist_ok=True)
+            missed.touch()
+            files[sid] = (s.status_path("claude", sid), label, missed, s.WORK_DIR / "locks" / f"claude-{sid}.lock")
         for name in ("tab-T-dead-old", "tab-T-alive-old"):
             with s.locked(name):
                 pass
