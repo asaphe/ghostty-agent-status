@@ -71,6 +71,8 @@ INPUT_WINDOW_SECONDS = 10
 LOCK_WAIT_SECONDS = 2.0
 MESSAGE_MAX = 120
 PRUNE_AFTER_SECONDS = 24 * 3600
+# A probe that misses holds the shared title-probe lock for up to ~35 s, so one is not retried on every hook event.
+PROBE_BACKOFF_SECONDS = 300
 
 
 def background_message(payload: dict) -> str | None:
@@ -560,6 +562,29 @@ def label_path(agent: str, session_id: str) -> Path:
     return WORK_DIR / "labels" / f"{_key(agent, session_id)}.json"
 
 
+def probe_miss_path(agent: str, session_id: str) -> Path:
+    return WORK_DIR / "probe-misses" / f"{_key(agent, session_id)}.json"
+
+
+def _modified_within(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return False
+
+
+def recorded_terminal() -> str | None:
+    """This Claude session's terminal as its status hook already resolved it, so callers can skip a tty probe."""
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not session_id:
+        return None
+    record = read_status("claude", session_id)
+    pid = os.environ.get("CLAUDE_PID", "")
+    if pid.isdigit() and record.get("pid") != int(pid):
+        return None
+    return record.get("ghostty_terminal_id") or None
+
+
 def session_on(terminal_id: str) -> dict | None:
     """The most recently updated session shown in a terminal."""
     found = [r for r in all_status() if r.get("ghostty_terminal_id") == terminal_id]
@@ -602,7 +627,7 @@ def prune() -> None:
                 kept_terminals.add(record.get("ghostty_terminal_id"))
                 continue
             for stale in (path, WORK_DIR / "labels" / path.name, WORK_DIR / "events" / path.name,
-                          WORK_DIR / "locks" / f"{path.stem}.lock"):
+                          WORK_DIR / "probe-misses" / path.name, WORK_DIR / "locks" / f"{path.stem}.lock"):
                 stale.unlink(missing_ok=True)
     stale_files = [lock for lock in (WORK_DIR / "locks").glob("tab-*.lock") if lock.stem[4:] not in kept_terminals]
     stale_files += list(STATUS_DIR.glob(".*.tmp"))
@@ -629,8 +654,12 @@ def apply(agent: str, session_id: str, event: str) -> None:
                 write_status(record)
         # Codex redraws its spinner title faster than a tty probe can be read back, so its own title goes first.
         terminal_id = codex_terminal_by_name(session_id) if agent == "codex" else None
-        if not terminal_id and tty:
+        missed = probe_miss_path(agent, session_id)
+        if not terminal_id and tty and not _modified_within(missed, PROBE_BACKOFF_SECONDS):
             terminal_id = ghostty_tabs.terminals_for_ttys([tty]).get(tty)
+            if not terminal_id:
+                missed.parent.mkdir(parents=True, exist_ok=True)
+                missed.touch()
         if not terminal_id:
             return
         with locked(_key(agent, session_id)):
