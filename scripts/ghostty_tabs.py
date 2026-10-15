@@ -36,6 +36,10 @@ class GhosttyError(RuntimeError):
     pass
 
 
+class GhosttyTimeout(GhosttyError):
+    pass
+
+
 def in_ghostty() -> bool:
     return os.environ.get("TERM_PROGRAM", "").casefold() == "ghostty"
 
@@ -49,7 +53,7 @@ def osascript(script: str, *args: str) -> str:
                              timeout=OSASCRIPT_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired as exc:
         diagnostics.emit("ghostty.call_error", reason="timeout", elapsed_ms=(time.monotonic() - started) * 1000)
-        raise GhosttyError("Ghostty AppleScript call timed out") from exc
+        raise GhosttyTimeout("Ghostty AppleScript call timed out") from exc
     except OSError as exc:
         diagnostics.emit("ghostty.call_error", error_type=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
         raise
@@ -143,13 +147,22 @@ end run
 def terminals() -> list[Terminal]:
     started = time.monotonic()
     found = []
+    out = None
     for _ in range(LAYOUT_ATTEMPTS):
-        out = osascript(BULK_LIST_SCRIPT)
-        if out != LAYOUT_CHANGED:
+        try:
+            bulk = osascript(BULK_LIST_SCRIPT)
+        except GhosttyTimeout:
+            raise
+        except GhosttyError:
+            diagnostics.emit("ghostty.list_fallback", reason="bulk_error")
+            break
+        if bulk != LAYOUT_CHANGED:
+            out = bulk
             break
         diagnostics.emit("ghostty.list_retry", reason="layout_changed")
     else:
         diagnostics.emit("ghostty.list_fallback", reason="layout_changed")
+    if out is None:
         out = osascript(LIST_SCRIPT)
     for row in out.split(ROW):
         parts = row.split(FIELD)

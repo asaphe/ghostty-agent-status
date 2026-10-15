@@ -6,6 +6,9 @@ import tempfile
 import uuid
 from pathlib import Path
 
+# Every file diagnostics.SOURCE_FILES hashes: a route missing one would drop every trace row.
+REQUIRED = ("ghostty-status.py", "terminal_status.py", "diagnostics.py", "diagnostic_dispatch.py", "ghostty_tabs.py")
+
 
 def registry() -> Path:
     base = Path(os.environ.get("GHOSTTY_AGENT_STATUS_DIR") or Path.home() / ".local/state/ghostty-agent-status")
@@ -22,7 +25,7 @@ def route_for(agent: str, session_id: str) -> dict | None:
         source, output = Path(route["source"]), Path(route["output"])
         if not source.is_absolute() or not output.is_absolute():
             return None
-        if not all((source / name).is_file() for name in ("ghostty-status.py", "terminal_status.py", "diagnostics.py", "ghostty_tabs.py")):
+        if not all((source / name).is_file() for name in REQUIRED):
             return None
         return {"source": str(source), "output": str(output)}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -46,7 +49,7 @@ def set_route(agent: str, session_id: str, source: str | None, output: str | Non
         data.pop(key, None)
     else:
         source_path = Path(source).resolve(strict=True)
-        if not all((source_path / name).is_file() for name in ("ghostty-status.py", "terminal_status.py", "diagnostics.py", "ghostty_tabs.py")):
+        if not all((source_path / name).is_file() for name in REQUIRED):
             raise ValueError("diagnostic source is incomplete")
         data[key] = {"source": str(source_path), "output": str(Path(output).resolve())}
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".routes-", suffix=".tmp")

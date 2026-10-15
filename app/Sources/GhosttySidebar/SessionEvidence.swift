@@ -1,10 +1,15 @@
 import Foundation
 
-func timestamp(_ value: String?) -> Date? {
-    guard let value else { return nil }
+private let fractionalTimestamps: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions.insert(.withFractionalSeconds)
-    return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    return formatter
+}()
+private let wholeSecondTimestamps = ISO8601DateFormatter()
+
+func timestamp(_ value: String?) -> Date? {
+    guard let value else { return nil }
+    return fractionalTimestamps.date(from: value) ?? wholeSecondTimestamps.date(from: value)
 }
 
 struct Evidence: Equatable {
@@ -39,14 +44,14 @@ enum SessionEvidence {
         let event = payload["type"] as? String ?? ""
         if type == "event_msg" {
             if ["task_complete", "turn_aborted"].contains(event) { return Evidence(state: "idle", date: date) }
-            if ["task_started", "user_message"].contains(event) { return Evidence(state: "working", date: date, clearsWaiting: event == "user_message") }
+            if ["task_started", "user_message"].contains(event) { return Evidence(state: "working", date: date) }
         }
         if type == "response_item" {
             if event == "message", payload["role"] as? String == "assistant", payload["phase"] as? String == "final_answer" {
                 return Evidence(state: "idle", date: date)
             }
             if event == "message", payload["role"] as? String == "user" {
-                return Evidence(state: "working", date: date, clearsWaiting: true)
+                return Evidence(state: "working", date: date)
             }
             if ["function_call", "custom_tool_call"].contains(event) {
                 let name = payload["name"] as? String ?? ""
@@ -59,6 +64,17 @@ enum SessionEvidence {
 
     static func shortTool(_ name: String) -> String {
         (name.components(separatedBy: ".").last ?? name).components(separatedBy: "__").last ?? name
+    }
+
+    // Context Codex itself writes as user-role rows, observed in recorded transcripts: it answers no question.
+    static let injectedPrefixes = ["# AGENTS.md instructions", "<environment_context>", "<guardian_tool_descriptions>",
+                                   "<node_repl_review_evidence>", "<recommended_plugins>", "<skill>", "<turn_aborted>",
+                                   "<user_action>"]
+
+    static func typedPrompt(_ blocks: [String]) -> String? {
+        let texts = blocks.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let injected = !texts.isEmpty && texts.allSatisfy { text in injectedPrefixes.contains(where: text.hasPrefix) }
+        return injected ? nil : blocks.joined()
     }
 
     static func questionReplies(_ text: String) -> [String: Set<Int>]? {
@@ -104,14 +120,15 @@ enum SessionEvidence {
             let type = row["type"] as? String ?? ""
             let call = payload["call_id"] as? String ?? "missing_call_id"
             if current.state == "idle" || (type == "event_msg" && event == "task_started") {
-                pending.removeAll()
-                asynchronous.removeAll()
+                // An asynchronous question outlives the turn that asked it: only its answer or a new prompt ends it.
+                pending = pending.filter { asynchronous.contains($0.key) }
+                asynchronous.formIntersection(pending.keys)
                 resolved = false
             }
             var prompt: String?
             if type == "response_item", event == "message", payload["role"] as? String == "user" {
                 let blocks = payload["content"] as? [[String: Any]] ?? []
-                prompt = blocks.compactMap { $0["text"] as? String }.joined()
+                prompt = typedPrompt(blocks.compactMap { $0["text"] as? String })
             } else if type == "event_msg", event == "user_message" {
                 prompt = payload["message"] as? String
             }
@@ -250,7 +267,7 @@ enum Reconcile {
     static func state(_ original: SessionStatus, place: TerminalPlace?, evidence: Evidence?, now: Date) -> SessionStatus {
         var result = original
         var reason = "hook_retained"
-        defer {
+        defer { if Diagnostics.enabled {
             var fields: [String: Any] = ["session_id": original.sessionId, "hook_state": original.state,
                                        "state": result.state, "reason": reason]
             if let id = original.ghosttyTerminalId { fields["terminal_id"] = id }
@@ -260,11 +277,12 @@ enum Reconcile {
                 fields["evidence_ms"] = evidence.date.timeIntervalSince1970 * 1000
             }
             Diagnostics.emit("sidebar.reconcile", agent: original.agent, fields: fields)
-        }
+        } }
         guard original.state != "done" else { return result }
         let reported = timestamp(original.updatedAt) ?? .distantPast
         if let evidence {
-            let unresolvedQuestion = original.agent == "codex" && original.state == "waiting"
+            let permission = original.message == "permission" || original.message?.hasPrefix("permission: ") == true
+            let unresolvedQuestion = original.agent == "codex" && original.state == "waiting" && !permission
                 && evidence.state == "working" && !evidence.clearsWaiting
             if evidence.date > reported.addingTimeInterval(1), evidence.state != original.state, !unresolvedQuestion {
                 result.state = evidence.state

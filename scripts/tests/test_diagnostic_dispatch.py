@@ -45,6 +45,23 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(dispatch.route_for("codex", sid))
         self.assertIsNone(dispatch.route_for("codex", "invalid"))
 
+    def test_a_route_needs_every_file_the_trace_source_id_hashes(self):
+        import diagnostics
+        self.assertEqual(set(dispatch.REQUIRED), set(diagnostics.SOURCE_FILES))
+        sid = str(uuid.uuid4())
+        partial = Path(self.tmp.name) / "partial"
+        partial.mkdir()
+        for name in dispatch.REQUIRED:
+            if name != "diagnostic_dispatch.py":
+                (partial / name).write_text("")
+        dispatch.registry().parent.mkdir(parents=True)
+        dispatch.registry().write_text(json.dumps({f"codex-{sid}": {"source": str(partial), "output": self.tmp.name}}))
+        self.assertIsNone(dispatch.route_for("codex", sid))
+        with self.assertRaises(ValueError):
+            dispatch.set_route("codex", sid, str(partial), self.tmp.name)
+        (partial / "diagnostic_dispatch.py").write_text("")
+        self.assertEqual(dispatch.route_for("codex", sid)["source"], str(partial))
+
     def test_dispatch_is_opt_in_and_does_not_consume_input_before_exec(self):
         spec = importlib.util.spec_from_file_location("diagnostic_hook_test", self.source / "ghostty-status.py")
         hook = importlib.util.module_from_spec(spec)

@@ -100,14 +100,37 @@ class StateTests(unittest.TestCase):
         self.assertIn("main:call:other", tracking["pending"])
         self.assertTrue(any(key.startswith("child:") for key in tracking["pending"]))
 
-    def test_failed_or_finished_async_question_clears_tracking(self):
-        for event in ("PostToolUseFailure", "Stop", "StopFailure", "SessionEnd"):
+    def test_failed_or_ended_async_question_clears_tracking(self):
+        for event in ("PostToolUseFailure", "SessionEnd"):
             tracking = {}
             question = self.question(tool_name="request_user_input_async")
             s.transition({"state": "working"}, question, tracking)
             s.transition({"state": "waiting"}, {**question, "hook_event_name": event}, tracking)
             self.assertFalse(tracking["pending"], event)
             self.assertFalse(tracking["async_questions"], event)
+
+    def test_async_question_outlives_its_turn_until_answered(self):
+        reply = "<send_user_message_question_reply>" + json.dumps(
+            [{"answer": "Yes", "questionItemId": json.dumps(["request_user_input_async", "question-1", 0])}])
+        for turn_end in ("Stop", "StopFailure"):
+            for answer in (reply, "no"):
+                tracking = {}
+                question = self.question(tool_name="request_user_input_async")
+                s.transition({"state": "working"}, question, tracking)
+                s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse", "tool_response": {"accepted": True}}, tracking)
+                s.transition({"state": "waiting"}, {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "work"}, tracking)
+                self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": turn_end}, tracking)[0], "waiting", turn_end)
+                self.assertEqual(list(tracking["pending"]), ["main:call:question-1"])
+                self.assertNotIn("main:call:work", tracking["call_inputs"])
+                self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": answer}, tracking), ("working", None))
+                self.assertFalse(tracking["pending"] or tracking["async_questions"])
+
+    def test_id_migration_leaves_no_stale_question_entry(self):
+        tracking = {}
+        question = self.question(tool_name="request_user_input_async")
+        s.transition({"state": "working"}, {k: v for k, v in question.items() if k != "tool_use_id"}, tracking)
+        s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse"}, tracking)
+        self.assertEqual(list(tracking["async_questions"]), ["main:call:question-1"])
 
     def test_explicit_rejected_async_delivery_clears_but_unknown_receipts_do_not(self):
         for response, expected in (({"accepted": False}, "working"), ('{"accepted":false}', "working"),
@@ -612,6 +635,23 @@ class StatusFileTests(unittest.TestCase):
                 patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
             s.apply("codex", "sid-1", "Stop")
         self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
+
+    def test_a_finished_turn_retries_a_missed_probe_once_per_backoff(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}) as probe:
+            for event in ("UserPromptSubmit", "Stop", "Stop", "PreToolUse"):
+                s.apply("codex", "sid-1", event)
+        self.assertEqual(probe.call_count, 2)
+        expired = __import__("time").time() - s.PROBE_BACKOFF_SECONDS - 1
+        os.utime(s.stop_miss_path("codex", "sid-1"), (expired, expired))
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}) as probe:
+            s.apply("codex", "sid-1", "Stop")
+        self.assertEqual(probe.call_count, 1)
 
     def test_a_worker_that_waited_out_another_probe_miss_probes_again_only_after_a_turn(self):
         self.run_hook("UserPromptSubmit")

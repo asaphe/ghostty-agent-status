@@ -41,8 +41,11 @@ final class StatusTests {
         tests.testCodexBlockingCompletionClearsWait()
         tests.testCodexStructuredRepliesClearOnlyAnsweredItems()
         tests.testCodexPlainReplyRemainsWorkingThroughOtherCalls()
-        tests.testCodexTerminalEventsCancelUnansweredQuestions()
+        tests.testCodexTerminalEventsCancelUnansweredBlockingQuestions()
+        tests.testCodexAsyncQuestionOutlivesItsTurnUntilAnswered()
+        tests.testCodexInjectedContextDoesNotAnswerAQuestion()
         tests.testCodexUnrelatedEvidenceCannotOverridePendingHook()
+        tests.testCodexPermissionWaitYieldsToNewerWork()
         tests.testCodexRejectedAsyncDeliveryClearsWait()
         tests.testTitleProbeDoesNotBreakIdentity()
         tests.testTwoTabsWithSameTitleAreAmbiguous()
@@ -59,7 +62,7 @@ final class StatusTests {
         tests.testPanelFollowsWindowOnSecondScreen()
         tests.testDropTargetPrefersLargestOverlapAndReachesBesideWindow()
         tests.testWindowTitleMatchesOnlyWhenUnique()
-        print("42 status tests passed")
+        print("45 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -296,12 +299,39 @@ final class StatusTests {
             XCTAssertEqual(evidence?.clearsWaiting, true)
         }
     }
-    func testCodexTerminalEventsCancelUnansweredQuestions() {
+    func testCodexTerminalEventsCancelUnansweredBlockingQuestions() {
         for end: [String: Any] in [["type": "task_complete"], ["type": "turn_aborted"],
                                   ["type": "message", "role": "assistant", "phase": "final_answer"]] {
-            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), end]))?.state, "idle")
-            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), end, ["type": "task_started"]]))?.state, "working")
+            let question = codexQuestion(asynchronous: false)
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([question, end]))?.state, "idle")
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([question, end, ["type": "task_started"]]))?.state, "working")
         }
+    }
+    func testCodexAsyncQuestionOutlivesItsTurnUntilAnswered() {
+        let asked = [codexQuestion(), ["type": "function_call_output", "call_id": "q", "output": "{\"accepted\":true}"],
+                     ["type": "function_call", "name": "sleep", "call_id": "sleep"], ["type": "function_call_output", "call_id": "sleep"],
+                     ["type": "message", "role": "assistant", "phase": "final_answer"], ["type": "task_complete"]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(asked))?.state, "waiting")
+        let injected: [String: Any] = ["type": "message", "role": "user", "content": [
+            ["type": "input_text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>x</INSTRUCTIONS>"],
+            ["type": "input_text", "text": "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"]]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(asked + [["type": "task_started"], injected]))?.state, "waiting")
+        for answer: [[String: Any]] in [[questionReply("q")],
+                                        [["type": "task_started"], questionReply("q")],
+                                        [["type": "task_started"], ["type": "message", "role": "user", "content": [["type": "input_text", "text": "no"]]]]] {
+            let evidence = SessionEvidence.codexEvidence(codexRows(asked + answer))
+            XCTAssertEqual(evidence?.state, "working")
+            XCTAssertEqual(evidence?.clearsWaiting, true)
+        }
+    }
+    func testCodexInjectedContextDoesNotAnswerAQuestion() {
+        for text in SessionEvidence.injectedPrefixes {
+            let row: [String: Any] = ["type": "message", "role": "user", "content": [["type": "input_text", "text": "\(text) body"]]]
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), row]))?.state, "waiting")
+        }
+        let mixed: [String: Any] = ["type": "message", "role": "user", "content": [
+            ["type": "input_text", "text": "<skill> <name>x</name>"], ["type": "input_text", "text": "Red"]]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), mixed]))?.state, "working")
     }
     func testCodexUnrelatedEvidenceCannotOverridePendingHook() {
         var session = record("waiting")
@@ -310,6 +340,15 @@ final class StatusTests {
         XCTAssertEqual(rows([session], layout(), source: unrelated).first?.state, "waiting")
         let answer = Evidence(state: "working", date: Date(timeIntervalSince1970: 950), clearsWaiting: true)
         XCTAssertEqual(rows([session], layout(), source: answer).first?.state, "working")
+    }
+    func testCodexPermissionWaitYieldsToNewerWork() {
+        for message in ["permission: Bash", "permission"] {
+            var session = record("waiting")
+            session.agent = "codex"
+            session.message = message
+            let newer = Evidence(state: "working", date: Date(timeIntervalSince1970: 950))
+            XCTAssertEqual(rows([session], layout(), source: newer).first?.state, "working")
+        }
     }
     func testCodexRejectedAsyncDeliveryClearsWait() {
         for (output, expected) in [("{\"accepted\":false}", "working"), ("{\"accepted\":true}", "waiting"),

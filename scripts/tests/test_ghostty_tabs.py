@@ -40,6 +40,16 @@ class ListingTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in call.call_args_list],
                          [g.BULK_LIST_SCRIPT] * g.LAYOUT_ATTEMPTS + [g.LIST_SCRIPT])
 
+    def test_a_failed_bulk_query_falls_back_but_a_timed_out_one_does_not(self):
+        raw = g.FIELD.join(["T1", "tab1", "w1", "zsh", "zsh", "/", "false"]) + g.ROW
+        with patch.object(g, "osascript", side_effect=[g.GhosttyError("bulk failed"), raw]) as call:
+            self.assertEqual([t.id for t in g.terminals()], ["T1"])
+        self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT, g.LIST_SCRIPT])
+        with patch.object(g, "osascript", side_effect=[g.GhosttyTimeout("timed out"), raw]) as call:
+            with self.assertRaises(g.GhosttyTimeout):
+                g.terminals()
+        self.assertEqual(call.call_count, 1)
+
 
 class TtyProbeTests(unittest.TestCase):
     def setUp(self):

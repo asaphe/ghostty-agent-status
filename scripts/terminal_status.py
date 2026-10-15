@@ -89,11 +89,18 @@ def display_state(record: dict) -> str:
     return state
 
 
+def short_tool(name: str) -> str:
+    return name.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
+
+
+def question_indices(payload: dict) -> list[int]:
+    return list(range(max(1, len((payload.get("tool_input") or {}).get("questions") or []))))
+
+
 def state_for(payload: dict) -> tuple[str, str | None] | None:
     """(state, message) for a hook event, or None when the event says nothing about the state."""
     event = payload.get("hook_event_name")
     tool = payload.get("tool_name") or ""
-    short_tool = tool.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
     if event == "SessionStart":
         return "idle", None
     if event == "Stop":
@@ -104,7 +111,7 @@ def state_for(payload: dict) -> tuple[str, str | None] | None:
         return "done", None
     if event == "PermissionRequest":
         return "waiting", f"permission: {tool}" if tool else "permission"
-    if event == "PreToolUse" and short_tool in WAITING_TOOLS:
+    if event == "PreToolUse" and short_tool(tool) in WAITING_TOOLS:
         questions = (payload.get("tool_input") or {}).get("questions") or [{}]
         return "waiting", (questions[0].get("question") or questions[0].get("title") or "question")[:MESSAGE_MAX]
     # A subagent's tool calls and its stop say nothing about whether the main agent is waiting on the user.
@@ -164,7 +171,7 @@ def question_replies(prompt: str) -> dict[str, set[int]] | None:
             except (ValueError, TypeError):
                 continue
             if (isinstance(identity, list) and len(identity) == 3 and isinstance(identity[0], str)
-                    and identity[0].rsplit(".", 1)[-1].rsplit("__", 1)[-1] == "request_user_input_async"
+                    and short_tool(identity[0]) == "request_user_input_async"
                     and isinstance(identity[1], str) and type(identity[2]) is int and identity[2] >= 0):
                 replies.setdefault(identity[1], set()).add(identity[2])
     except (ValueError, TypeError):
@@ -183,7 +190,7 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
     before_message = tracking.get("main_message")
     calls = tracking.setdefault("call_inputs", {})
     questions = tracking.setdefault("async_questions", {})
-    tool = str(payload.get("tool_name") or "").rsplit(".", 1)[-1].rsplit("__", 1)[-1]
+    tool = short_tool(str(payload.get("tool_name") or ""))
     change = state_for(payload)
     if change is None and event not in {"SubagentStop", "PostToolUse", "PostToolUseFailure"}:
         return None
@@ -215,7 +222,9 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
     if event in {"UserPromptSubmit", "Stop", "StopFailure"}:
         replies = question_replies(payload.get("prompt")) if event == "UserPromptSubmit" else None
         if replies is None:
-            forget([waiting for waiting in set(pending) | set(calls) if waiting.startswith("main:")])
+            # An asynchronous question outlives the turn that asked it: only its answer or a new prompt ends it.
+            kept = set(questions) if event != "UserPromptSubmit" else set()
+            forget([waiting for waiting in set(pending) | set(calls) if waiting.startswith("main:") and waiting not in kept])
         else:
             for call, answered in replies.items():
                 matches = [waiting for waiting in questions if waiting.endswith(f":call:{call}")]
@@ -232,7 +241,7 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
         if event == "PostToolUse" and tool == "request_user_input_async" and fallback in pending and key not in questions and not rejected:
             pending[key] = pending.pop(fallback)
             calls[key] = fallback
-            questions[key] = list(range(max(1, len((payload.get("tool_input") or {}).get("questions") or []))))
+            questions[key] = questions.pop(fallback, None) or question_indices(payload)
         if event != "PostToolUse" or key not in questions or rejected:
             original = calls.get(key, fallback)
             ambiguous = any(known != key and value == original for known, value in calls.items())
@@ -246,7 +255,7 @@ def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | Non
         if event != "Notification" or not pending:
             pending[key] = change[1]
         if event == "PreToolUse" and tool == "request_user_input_async":
-            questions[key] = list(range(max(1, len((payload.get("tool_input") or {}).get("questions") or []))))
+            questions[key] = question_indices(payload)
     elif change and actor == "main":
         tracking["main_state"] = change[0]
         if event != "Notification" or payload.get("notification_type") != "idle_prompt":
@@ -677,6 +686,10 @@ def probe_miss_path(agent: str, session_id: str) -> Path:
     return WORK_DIR / "probe-misses" / f"{_key(agent, session_id)}.json"
 
 
+def stop_miss_path(agent: str, session_id: str) -> Path:
+    return WORK_DIR / "probe-misses" / f"{_key(agent, session_id)}.stop"
+
+
 def _modified_within(path: Path, seconds: float) -> bool:
     try:
         return time.time() - path.stat().st_mtime < seconds
@@ -749,7 +762,8 @@ def prune() -> None:
                 kept_terminals.add(record.get("ghostty_terminal_id"))
                 continue
             for stale in (path, WORK_DIR / "labels" / path.name, WORK_DIR / "events" / path.name,
-                          WORK_DIR / "probe-misses" / path.name, WORK_DIR / "locks" / f"{path.stem}.lock"):
+                          WORK_DIR / "probe-misses" / path.name, WORK_DIR / "probe-misses" / f"{path.stem}.stop",
+                          WORK_DIR / "locks" / f"{path.stem}.lock"):
                 stale.unlink(missing_ok=True)
     stale_files = [lock for lock in (WORK_DIR / "locks").glob("tab-*.lock") if lock.stem[4:] not in kept_terminals]
     stale_files += list(STATUS_DIR.glob(".*.tmp"))
@@ -787,17 +801,19 @@ def _apply(agent: str, session_id: str, event: str) -> None:
         # Codex redraws its spinner title faster than a tty probe can be read back, so its own title goes first.
         terminal_id = codex_terminal_by_name(session_id) if agent == "codex" else None
         missed = probe_miss_path(agent, session_id)
-        # A finished turn stops the agent's spinner, the one point a probe title reliably stays put.
-        if not terminal_id and tty and (event == "Stop" or not _modified_within(missed, PROBE_BACKOFF_SECONDS)):
+        # A finished turn stops the agent's spinner, the one point a probe title reliably stays put, so Stop keeps its own backoff.
+        backoff = stop_miss_path(agent, session_id) if event == "Stop" else missed
+        if not terminal_id and tty and not _modified_within(backoff, PROBE_BACKOFF_SECONDS):
             def resolved_meanwhile() -> str | None:
                 if found := read_status(agent, session_id).get("ghostty_terminal_id"):
                     return found
-                return "" if event != "Stop" and _modified_within(missed, PROBE_BACKOFF_SECONDS) else None
+                return "" if _modified_within(backoff, PROBE_BACKOFF_SECONDS) else None
 
             terminal_id = ghostty_tabs.terminals_for_ttys([tty], cached=resolved_meanwhile).get(tty)
             if not terminal_id:
-                missed.parent.mkdir(parents=True, exist_ok=True)
-                missed.touch()
+                for marker in {missed, backoff}:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.touch()
         if not terminal_id:
             diagnostics.emit("worker.skipped", reason="terminal_unresolved")
             return

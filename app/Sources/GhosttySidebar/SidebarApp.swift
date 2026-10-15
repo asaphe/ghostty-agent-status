@@ -101,10 +101,12 @@ final class StatusStore: ObservableObject {
                     let groups = self.group(live)
                     if groups != self.groups { self.groups = groups }
                     Diagnostics.emit("sidebar.published", fields: ["row_count": live.count, "elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000])
-                    for row in live {
-                        var fields: [String: Any] = ["session_id": row.sessionId, "state": row.state]
-                        if let id = row.ghosttyTerminalId { fields["terminal_id"] = id }
-                        Diagnostics.emit("sidebar.row", agent: row.agent, fields: fields)
+                    if Diagnostics.enabled {
+                        for row in live {
+                            var fields: [String: Any] = ["session_id": row.sessionId, "state": row.state]
+                            if let id = row.ghosttyTerminalId { fields["terminal_id"] = id }
+                            Diagnostics.emit("sidebar.row", agent: row.agent, fields: fields)
+                        }
                     }
                 }
             }
@@ -167,31 +169,46 @@ enum Ghostty {
     return out
     """
 
-    static func tabLayout() -> TabLayout? {
+    enum ScriptResult {
+        case output(String)
+        case failed
+        case timedOut
+    }
+
+    static func tabLayout(run: (String) -> ScriptResult = runScript) -> TabLayout? {
         let started = ProcessInfo.processInfo.systemUptime
         Diagnostics.emit("sidebar.ghostty_start")
         defer { Diagnostics.emit("sidebar.ghostty_end", fields: ["elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000]) }
         // The per-terminal fallback is slower and fails outright when a tab closes mid-loop, so the bulk query is retried first.
-        for _ in 0..<3 {
-            guard let text = runScript(bulkTabLayoutScript) else { return nil }
-            if text.trimmingCharacters(in: .whitespacesAndNewlines) != layoutChanged { return parseLayout(text) }
-            Diagnostics.emit("sidebar.ghostty_retry", fields: ["reason": "layout_changed"])
+        var reason = "layout_changed"
+        attempts: for _ in 0..<3 {
+            switch run(bulkTabLayoutScript) {
+            case .timedOut:
+                return nil
+            case .failed:
+                reason = "bulk_error"
+                break attempts
+            case .output(let text):
+                if text.trimmingCharacters(in: .whitespacesAndNewlines) != layoutChanged { return parseLayout(text) }
+                Diagnostics.emit("sidebar.ghostty_retry", fields: ["reason": "layout_changed"])
+            }
         }
-        Diagnostics.emit("sidebar.ghostty_fallback", fields: ["reason": "layout_changed"])
-        guard let fallback = runScript(tabLayoutScript) else { return nil }
+        Diagnostics.emit("sidebar.ghostty_fallback", fields: ["reason": reason])
+        guard case .output(let fallback) = run(tabLayoutScript) else { return nil }
         return parseLayout(fallback)
     }
 
-    static func runScript(_ script: String) -> String? {
+    static func runScript(_ script: String) -> ScriptResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", script]
         let pipe = Pipe()
+        let errors = Pipe()
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
         do { try process.run() } catch {
             Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "launch_failed"])
-            return nil
+            return .failed
         }
         let watchdog = DispatchWorkItem {
             if process.isRunning {
@@ -202,12 +219,17 @@ enum Ghostty {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10, execute: watchdog)
         defer { watchdog.cancel() }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = errors.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        // -1712 is AppleScript's own `with timeout` expiring: Ghostty is busy, so a slower query would time out too.
+        if process.terminationReason == .uncaughtSignal || String(decoding: stderr, as: UTF8.self).contains("(-1712)") {
+            return .timedOut
+        }
         guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
             Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "nonzero_or_invalid_output", "returncode": process.terminationStatus])
-            return nil
+            return .failed
         }
-        return text
+        return .output(text)
     }
 
     static func parseLayout(_ text: String) -> TabLayout? {

@@ -53,7 +53,7 @@ The sidebar keeps keyboard focus in Ghostty. With **One Sidebar per Window** and
 |---|---|
 | `UserPromptSubmit`, the main agent's tool events | working |
 | `PermissionRequest` (tool permission, AskUserQuestion, plan approval), `Notification` `permission_prompt`/`elicitation_dialog`, a question tool | waiting |
-| `Stop`, `StopFailure`, `SessionStart`, `Notification` `idle_prompt` | idle (`Stop`'s running `background_tasks` become the row's message) |
+| `Stop`, `StopFailure`, `SessionStart`, `Notification` `idle_prompt` | idle (`Stop`'s running `background_tasks` become the row's message); a Codex asynchronous question (`request_user_input_async`) keeps the session waiting past the end of its turn until it is answered or a new prompt is typed |
 | `SessionEnd` | done |
 
 **Claude Code fires no hook when you deny a permission, press Esc, or decline a plan.** The sidebar ends those turns from the session transcript instead: the `[Request interrupted by user` row or the `turn_duration` row that Claude Code writes. Tab titles still show the last hook state until the next event. Codex records interrupts as `turn_aborted` in its rollout, which the sidebar reads the same way.

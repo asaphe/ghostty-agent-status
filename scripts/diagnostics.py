@@ -24,6 +24,7 @@ NUMBERS = {"elapsed_ms", "pending_count", "returncode", "record_count", "row_cou
            "reported_ms", "source_ms", "bytes", "offset", "skipped_count"}
 FLAGS = {"changed", "matched", "available", "tool_input_present", "tool_use_id_present"}
 TOKENS = {"reason", "error_type", "operation", "row_type", "event_type", "phase", "marker"}
+SOURCE_FILES = ("diagnostics.py", "diagnostic_dispatch.py", "terminal_status.py", "ghostty_tabs.py", "ghostty-status.py")
 
 
 def state_root() -> Path:
@@ -72,7 +73,7 @@ def source_id() -> str:
     global _source_id
     if _source_id is None:
         digest = hashlib.sha256()
-        for name in ("diagnostics.py", "diagnostic_dispatch.py", "terminal_status.py", "ghostty_tabs.py", "ghostty-status.py"):
+        for name in SOURCE_FILES:
             digest.update(Path(__file__).with_name(name).read_bytes())
         _source_id = digest.hexdigest()[:16]
     return _source_id
