@@ -16,8 +16,11 @@ import os
 import secrets
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+import diagnostics
 
 OSASCRIPT_TIMEOUT_SECONDS = 20
 PROBE_ROUNDS = 3
@@ -33,19 +36,32 @@ class GhosttyError(RuntimeError):
     pass
 
 
+class GhosttyTimeout(GhosttyError):
+    pass
+
+
 def in_ghostty() -> bool:
     return os.environ.get("TERM_PROGRAM", "").casefold() == "ghostty"
 
 
 def osascript(script: str, *args: str) -> str:
     """Arguments reach the script as `argv`, never spliced into its source."""
+    started = time.monotonic()
+    diagnostics.emit("ghostty.call_start")
     try:
         out = subprocess.run(["osascript", "-", *args], input=script, capture_output=True, text=True,
                              timeout=OSASCRIPT_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired as exc:
-        raise GhosttyError("Ghostty AppleScript call timed out") from exc
+        diagnostics.emit("ghostty.call_error", reason="timeout", elapsed_ms=(time.monotonic() - started) * 1000)
+        raise GhosttyTimeout("Ghostty AppleScript call timed out") from exc
+    except OSError as exc:
+        diagnostics.emit("ghostty.call_error", error_type=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
+        raise
     if out.returncode != 0:
+        diagnostics.emit("ghostty.call_error", reason="nonzero_exit", returncode=out.returncode,
+                         elapsed_ms=(time.monotonic() - started) * 1000)
         raise GhosttyError(f"Ghostty AppleScript failed: {out.stderr.strip()[:200]}")
+    diagnostics.emit("ghostty.call_end", returncode=out.returncode, elapsed_ms=(time.monotonic() - started) * 1000)
     return out.stdout.rstrip("\n")
 
 
@@ -90,13 +106,69 @@ on run argv
 end run
 """
 
+# Reads each property for every terminal in one Apple event instead of one event per terminal.
+LAYOUT_CHANGED = "layout-changed"
+# The per-terminal fallback is slower and fails outright when a tab closes mid-loop, so the bulk query is retried first.
+LAYOUT_ATTEMPTS = 3
+BULK_LIST_SCRIPT = """
+on run argv
+  set fs to character id 31
+  set rs to character id 30
+  tell application "Ghostty"
+    set frontId to ""
+    try
+      set frontId to id of focused terminal of selected tab of front window
+    end try
+    set wids to id of every window
+    set tids to id of every tab of every window
+    set sids to id of every terminal of every tab of every window
+    set tnames to name of every tab of every window
+    set snames to name of every terminal of every tab of every window
+    set sdirs to working directory of every terminal of every tab of every window
+    set widsAfter to id of every window
+    set tidsAfter to id of every tab of every window
+    set sidsAfter to id of every terminal of every tab of every window
+  end tell
+  if wids is not widsAfter or tids is not tidsAfter or sids is not sidsAfter then return "layout-changed"
+  set out to ""
+  repeat with wi from 1 to count of wids
+    repeat with ti from 1 to count of item wi of tids
+      repeat with si from 1 to count of item ti of item wi of sids
+        set s to item si of item ti of item wi of sids
+        set out to out & s & fs & (item ti of item wi of tids) & fs & (item wi of wids) & fs & (item si of item ti of item wi of snames) & fs & (item ti of item wi of tnames) & fs & (item si of item ti of item wi of sdirs) & fs & (s is frontId) & rs
+      end repeat
+    end repeat
+  end repeat
+  return out
+end run
+"""
+
 
 def terminals() -> list[Terminal]:
+    started = time.monotonic()
     found = []
-    for row in osascript(LIST_SCRIPT).split(ROW):
+    out = None
+    for _ in range(LAYOUT_ATTEMPTS):
+        try:
+            bulk = osascript(BULK_LIST_SCRIPT)
+        except GhosttyTimeout:
+            raise
+        except GhosttyError:
+            diagnostics.emit("ghostty.list_fallback", reason="bulk_error")
+            break
+        if bulk != LAYOUT_CHANGED:
+            out = bulk
+            break
+        diagnostics.emit("ghostty.list_retry", reason="layout_changed")
+    else:
+        diagnostics.emit("ghostty.list_fallback", reason="layout_changed")
+    if out is None:
+        out = osascript(LIST_SCRIPT)
+    for row in out.split(ROW):
         parts = row.split(FIELD)
         if len(parts) == 7:
             found.append(Terminal(*parts[:6], frontmost=parts[6] == "true"))
+    diagnostics.emit("ghostty.list", row_count=len(found), elapsed_ms=(time.monotonic() - started) * 1000)
     return found
 
 
@@ -241,22 +313,36 @@ def _write_title(tty: str, title: str) -> bool:
         return False
 
 
-def terminals_for_ttys(ttys: list[str]) -> dict[str, str]:
-    """Serialize title probes so concurrent callers never save another caller's nonce as a title."""
+def terminals_for_ttys(ttys: list[str], cached: Callable[[], str | None] | None = None) -> dict[str, str]:
+    """Serialize title probes so concurrent callers never save another caller's nonce as a title.
+
+    CACHED, asked once the lock is held, returns a terminal another caller resolved while this one
+    waited, "" when another caller's probe of it just missed, or None to probe; a single tty then
+    skips a second probe.
+    """
     if not ttys:
         return {}
     path = f"/tmp/ghostty-title-probe-{os.getuid()}.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as lock:
-        deadline = time.monotonic() + PROBE_LOCK_WAIT_SECONDS
+        started = time.monotonic()
+        diagnostics.emit("probe.lock_wait")
+        deadline = started + PROBE_LOCK_WAIT_SECONDS
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                diagnostics.emit("probe.lock_acquired", elapsed_ms=(time.monotonic() - started) * 1000)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
+                    diagnostics.emit("probe.lock_timeout", elapsed_ms=(time.monotonic() - started) * 1000)
                     raise GhosttyError("another terminal title probe is in progress")
                 time.sleep(0.05)
+        if cached is not None and len(set(ttys)) == 1:
+            terminal_id = cached()
+            if terminal_id is not None:
+                diagnostics.emit("probe.skipped", reason="resolved_while_waiting" if terminal_id else "missed_while_waiting")
+                return {ttys[0]: terminal_id} if terminal_id else {}
         return _probe_ttys(ttys)
 
 
@@ -266,6 +352,7 @@ def _probe_ttys(ttys: list[str]) -> dict[str, str]:
     A program that sets its own title (Claude's spinner, Codex at startup) can overwrite a probe
     title before it is read, so titles are polled and unmatched ttys are probed again.
     """
+    diagnostics.emit("probe.start", row_count=len(ttys))
     pending = sorted(set(ttys))
     if not pending:
         return {}
@@ -297,6 +384,7 @@ def _probe_ttys(ttys: list[str]) -> dict[str, str]:
             for t in terminals():
                 if t.title in nonces and t.id in before:
                     _write_title(nonces[t.title], before[t.id])
+    diagnostics.emit("probe.end", row_count=len(found), matched=bool(found))
     return found
 
 

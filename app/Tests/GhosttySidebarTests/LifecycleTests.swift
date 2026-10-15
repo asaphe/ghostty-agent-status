@@ -36,6 +36,19 @@ final class WindowFixture {
 struct LifecycleTests {
     @MainActor
     static func main() {
+        let row = ["T1", "W1", "1", "1", "✳ Task", "/repo", "Window"].joined(separator: "\u{1f}") + "\u{1e}"
+        for bulk in [Ghostty.ScriptResult.failed, .output(Ghostty.layoutChanged)] {
+            var scripts: [String] = []
+            let layout = Ghostty.tabLayout { script in
+                scripts.append(script)
+                return script == Ghostty.tabLayoutScript ? .output(row) : bulk
+            }
+            precondition(layout?.places["T1"]?.cwd == "/repo" && scripts.last == Ghostty.tabLayoutScript)
+        }
+        var calls = 0
+        precondition(Ghostty.tabLayout { _ in calls += 1; return .timedOut } == nil && calls == 1)
+        print("Tab layout fallback tests passed")
+
         _ = NSApplication.shared
         guard !NSScreen.screens.isEmpty else {
             print("Controller lifecycle tests skipped: AppKit requires an available display")

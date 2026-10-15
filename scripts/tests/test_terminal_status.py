@@ -43,6 +43,148 @@ class ColorTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def question(self, call="question-1", **extra):
+        return {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": call,
+                "tool_input": {"questions": [{"question": "Choose?"}]}, **extra}
+
+    def test_changed_question_input_clears_by_call_id_and_permission_alias(self):
+        tracking = {}
+        question = self.question()
+        s.transition({"state": "working"}, question, tracking)
+        permission = {k: v for k, v in question.items() if k != "tool_use_id"}
+        s.transition({"state": "waiting"}, {**permission, "hook_event_name": "PermissionRequest"}, tracking)
+        self.assertEqual(len(tracking["pending"]), 1)
+        result = {**question, "hook_event_name": "PostToolUse", "tool_input": {"questions": [], "answers": {"Choose?": "Red"}}}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking), ("working", None))
+        self.assertFalse(tracking["pending"])
+
+    def test_identical_questions_with_distinct_ids_clear_independently(self):
+        tracking = {}
+        for call in ("a", "b"):
+            s.transition({"state": "working"}, self.question(call), tracking)
+        s.transition({"state": "waiting"}, {**self.question("a"), "hook_event_name": "PostToolUse"}, tracking)
+        self.assertEqual(list(tracking["pending"]), ["main:call:b"])
+
+    def test_completion_preserves_another_actors_identical_call_id(self):
+        tracking = {}
+        for actor in ("main", "child"):
+            s.transition({"state": "working"}, self.question(agent_id=actor), tracking)
+        s.transition({"state": "waiting"}, {**self.question(agent_id="main"), "hook_event_name": "PostToolUse"}, tracking)
+        self.assertEqual(list(tracking["pending"]), ["child:call:question-1"])
+
+    def test_async_delivery_and_unrelated_work_keep_question_pending(self):
+        tracking = {}
+        question = self.question(tool_name="functions.request_user_input_async")
+        s.transition({"state": "working"}, question, tracking)
+        for payload in ({**question, "hook_event_name": "PostToolUse"},
+                        {"hook_event_name": "PreToolUse", "tool_name": "sleep", "tool_use_id": "sleep"},
+                        {"hook_event_name": "PostToolUse", "tool_name": "sleep", "tool_use_id": "sleep"}):
+            self.assertEqual(s.transition({"state": "waiting"}, payload, tracking)[0], "waiting")
+        self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": "Red"}, tracking), ("working", None))
+        self.assertFalse(tracking["async_questions"])
+
+    def test_structured_partial_answer_preserves_other_questions_and_permissions(self):
+        tracking = {}
+        question = self.question(tool_name="request_user_input_async", tool_input={"questions": [{"title": "One"}, {"title": "Two"}]})
+        s.transition({"state": "working"}, question, tracking)
+        s.transition({"state": "waiting"}, self.question("other", tool_name="request_user_input_async"), tracking)
+        s.transition({"state": "waiting"}, {"hook_event_name": "PermissionRequest", "agent_id": "child", "tool_name": "Bash"}, tracking)
+        def reply(index):
+            return {"hook_event_name": "UserPromptSubmit", "prompt": "<send_user_message_question_reply>" + json.dumps([
+                {"questionItemId": "bad"}, {"answer": "Red", "questionItemId": json.dumps(["request_user_input_async", "question-1", index])}
+            ]) + "</send_user_message_question_reply>"}
+        self.assertEqual(s.transition({"state": "waiting"}, reply(0), tracking)[0], "waiting")
+        self.assertEqual(tracking["async_questions"]["main:call:question-1"], [1])
+        s.transition({"state": "waiting"}, reply(1), tracking)
+        self.assertNotIn("main:call:question-1", tracking["pending"])
+        self.assertIn("main:call:other", tracking["pending"])
+        self.assertTrue(any(key.startswith("child:") for key in tracking["pending"]))
+
+    def test_failed_or_ended_async_question_clears_tracking(self):
+        for event in ("PostToolUseFailure", "SessionEnd"):
+            tracking = {}
+            question = self.question(tool_name="request_user_input_async")
+            s.transition({"state": "working"}, question, tracking)
+            s.transition({"state": "waiting"}, {**question, "hook_event_name": event}, tracking)
+            self.assertFalse(tracking["pending"], event)
+            self.assertFalse(tracking["async_questions"], event)
+
+    def test_async_question_outlives_its_turn_until_answered(self):
+        reply = "<send_user_message_question_reply>" + json.dumps(
+            [{"answer": "Yes", "questionItemId": json.dumps(["request_user_input_async", "question-1", 0])}])
+        for turn_end in ("Stop", "StopFailure"):
+            for answer in (reply, "no"):
+                tracking = {}
+                question = self.question(tool_name="request_user_input_async")
+                s.transition({"state": "working"}, question, tracking)
+                s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse", "tool_response": {"accepted": True}}, tracking)
+                s.transition({"state": "waiting"}, {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "work"}, tracking)
+                self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": turn_end}, tracking)[0], "waiting", turn_end)
+                self.assertEqual(list(tracking["pending"]), ["main:call:question-1"])
+                self.assertNotIn("main:call:work", tracking["call_inputs"])
+                self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": answer}, tracking), ("working", None))
+                self.assertFalse(tracking["pending"] or tracking["async_questions"])
+
+    def test_id_migration_leaves_no_stale_question_entry(self):
+        tracking = {}
+        question = self.question(tool_name="request_user_input_async")
+        s.transition({"state": "working"}, {k: v for k, v in question.items() if k != "tool_use_id"}, tracking)
+        s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse"}, tracking)
+        self.assertEqual(list(tracking["async_questions"]), ["main:call:question-1"])
+
+    def test_explicit_rejected_async_delivery_clears_but_unknown_receipts_do_not(self):
+        for response, expected in (({"accepted": False}, "working"), ('{"accepted":false}', "working"),
+                                   ({"accepted": True}, "waiting"), ({"accepted": 0}, "waiting"), (None, "waiting")):
+            tracking = {}
+            question = self.question(tool_name="request_user_input_async")
+            s.transition({"state": "working"}, question, tracking)
+            self.assertEqual(s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse", "tool_response": response}, tracking)[0], expected)
+
+    def test_legacy_permission_key_still_clears_after_upgrade(self):
+        question = self.question()
+        tracking = {"pending": {"main:" + s.input_key(question): "Choose?"}, "main_state": "working"}
+        self.assertEqual(s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse"}, tracking), ("working", None))
+
+    def test_permission_only_bash_description_does_not_prevent_completion(self):
+        tracking = {}
+        permission = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "true", "description": "Approval"}}
+        s.transition({"state": "working"}, permission, tracking)
+        result = {**permission, "hook_event_name": "PostToolUse", "tool_use_id": "bash-1", "tool_input": {"command": "true"}}
+        self.assertEqual(s.transition({"state": "waiting"}, result, tracking), ("working", None))
+
+    def test_legacy_async_delivery_migrates_without_clearing_unanswered_question(self):
+        question = self.question(tool_name="request_user_input_async")
+        tracking = {"pending": {"main:" + s.input_key(question): "Choose?"}, "main_state": "working"}
+        self.assertEqual(s.transition({"state": "waiting"}, {**question, "hook_event_name": "PostToolUse"}, tracking)[0], "waiting")
+        self.assertEqual(list(tracking["pending"]), ["main:call:question-1"])
+        self.assertEqual(s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": "Red"}, tracking), ("working", None))
+
+    def test_malformed_or_unknown_structured_reply_does_not_clear_wait(self):
+        bodies = ["not json", "{}", '[{"questionItemId":"[\\"request_user_input_async\\",\\"unknown\\",0]"}]']
+        bodies += [json.dumps([{"questionItemId": json.dumps(["request_user_input_async", "question-1", index])}]) for index in (True, 0.0, -1)]
+        for body in bodies:
+            tracking = {}
+            s.transition({"state": "working"}, self.question(tool_name="request_user_input_async"), tracking)
+            s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": "<send_user_message_question_reply>" + body}, tracking)
+            self.assertEqual(len(tracking["pending"]), 1)
+
+    def test_ambiguous_structured_call_id_does_not_clear_another_actors_wait(self):
+        tracking = {}
+        for actor in ("main", "child"):
+            s.transition({"state": "working"}, self.question(agent_id=actor, tool_name="request_user_input_async"), tracking)
+        reply = json.dumps([{"questionItemId": json.dumps(["request_user_input_async", "question-1", 0])}])
+        s.transition({"state": "waiting"}, {"hook_event_name": "UserPromptSubmit", "prompt": "<send_user_message_question_reply>" + reply}, tracking)
+        self.assertEqual(len(tracking["pending"]), 2)
+
+    def test_idless_permission_with_identical_active_calls_waits_for_possible_owners(self):
+        tracking = {}
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "true"}}
+        for call in ("a", "b"):
+            s.transition({"state": "working"}, {**payload, "tool_use_id": call}, tracking)
+        s.transition({"state": "working"}, {**payload, "hook_event_name": "PermissionRequest"}, tracking)
+        self.assertEqual(s.transition({"state": "waiting"}, {**payload, "hook_event_name": "PostToolUse", "tool_use_id": "a"}, tracking)[0], "waiting")
+        self.assertEqual(s.transition({"state": "waiting"}, {**payload, "hook_event_name": "PostToolUse", "tool_use_id": "b"}, tracking), ("working", None))
+
     def test_codex_question_tools_wait_for_input(self):
         for name in ("request_user_input", "functions.request_user_input"):
             self.assertEqual(s.state_for({"hook_event_name": "PreToolUse", "tool_name": name,
@@ -478,6 +620,58 @@ class StatusFileTests(unittest.TestCase):
                 patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
             s.apply("codex", "sid-1", "PreToolUse")
         self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
+
+    def test_a_finished_turn_probes_again_inside_the_backoff(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}):
+            s.apply("codex", "sid-1", "UserPromptSubmit")
+        self.assertTrue(s._modified_within(s.probe_miss_path("codex", "sid-1"), s.PROBE_BACKOFF_SECONDS))
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={"/dev/ttys042": "T9"}), \
+                patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
+            s.apply("codex", "sid-1", "Stop")
+        self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
+
+    def test_a_finished_turn_retries_a_missed_probe_once_per_backoff(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}) as probe:
+            for event in ("UserPromptSubmit", "Stop", "Stop", "PreToolUse"):
+                s.apply("codex", "sid-1", event)
+        self.assertEqual(probe.call_count, 2)
+        expired = __import__("time").time() - s.PROBE_BACKOFF_SECONDS - 1
+        os.utime(s.stop_miss_path("codex", "sid-1"), (expired, expired))
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}) as probe:
+            s.apply("codex", "sid-1", "Stop")
+        self.assertEqual(probe.call_count, 1)
+
+    def test_a_worker_that_waited_out_another_probe_miss_probes_again_only_after_a_turn(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+
+        def probe(ttys, cached):
+            missed = s.probe_miss_path("codex", "sid-1")
+            missed.parent.mkdir(parents=True, exist_ok=True)
+            missed.touch()
+            return {} if cached() == "" else {"/dev/ttys042": "T9"}
+
+        for event, expected in (("PreToolUse", None), ("Stop", "T9")):
+            s.probe_miss_path("codex", "sid-1").unlink(missing_ok=True)
+            with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                    patch.object(s.ghostty_tabs, "terminals_for_ttys", side_effect=probe), \
+                    patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
+                s.apply("codex", "sid-1", event)
+            self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], expected, event)
 
     def test_recorded_terminal_is_this_session_only_while_its_process_owns_the_record(self):
         s.write_status({"agent": "claude", "session_id": "sid-1", "pid": 4242, "ghostty_terminal_id": "T7"})

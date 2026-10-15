@@ -37,6 +37,16 @@ final class StatusTests {
         tests.testCodexSpinnerDoesNotBecomePartOfIdentity()
         tests.testClaudeTranscriptSkipsSidechainAndAwaySummary()
         tests.testCodexTurnLifecycle()
+        tests.testCodexAsyncDeliveryRetainsWaitThroughOtherWork()
+        tests.testCodexBlockingCompletionClearsWait()
+        tests.testCodexStructuredRepliesClearOnlyAnsweredItems()
+        tests.testCodexPlainReplyRemainsWorkingThroughOtherCalls()
+        tests.testCodexTerminalEventsCancelUnansweredBlockingQuestions()
+        tests.testCodexAsyncQuestionOutlivesItsTurnUntilAnswered()
+        tests.testCodexInjectedContextDoesNotAnswerAQuestion()
+        tests.testCodexUnrelatedEvidenceCannotOverridePendingHook()
+        tests.testCodexPermissionWaitYieldsToNewerWork()
+        tests.testCodexRejectedAsyncDeliveryClearsWait()
         tests.testTitleProbeDoesNotBreakIdentity()
         tests.testTwoTabsWithSameTitleAreAmbiguous()
         tests.testSubsecondTranscriptCannotOverridePermissionHook()
@@ -52,7 +62,7 @@ final class StatusTests {
         tests.testPanelFollowsWindowOnSecondScreen()
         tests.testDropTargetPrefersLargestOverlapAndReachesBesideWindow()
         tests.testWindowTitleMatchesOnlyWhenUnique()
-        print("35 status tests passed")
+        print("45 status tests passed")
     }
 
     let now = Date(timeIntervalSince1970: 1000)
@@ -230,6 +240,122 @@ final class StatusTests {
         defer { try? FileManager.default.removeItem(at: url) }
         try Data("{\"timestamp\":\"2026-10-07T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n{\"type\":".utf8).write(to: url)
         XCTAssertEqual(SessionEvidence.read(url, agent: "codex")?.state, "idle")
+    }
+    func codexRows(_ payloads: [[String: Any]]) -> [[String: Any]] {
+        payloads.enumerated().map { index, payload in
+            ["timestamp": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(950 + index))),
+             "type": ["task_started", "task_complete", "turn_aborted", "user_message"].contains(payload["type"] as? String ?? "") ? "event_msg" : "response_item",
+             "payload": payload]
+        }
+    }
+    func codexQuestion(_ call: String = "q", asynchronous: Bool = true, count: Int = 1) -> [String: Any] {
+        let arguments = String(data: try! JSONSerialization.data(withJSONObject: ["questions": Array(repeating: ["title": "Choose"], count: count)]), encoding: .utf8)!
+        return ["type": "function_call", "name": asynchronous ? "functions.request_user_input_async" : "functions.request_user_input",
+                "call_id": call, "arguments": arguments]
+    }
+    func questionReply(_ call: String, index: Int = 0) -> [String: Any] {
+        let item = String(data: try! JSONSerialization.data(withJSONObject: ["request_user_input_async", call, index]), encoding: .utf8)!
+        return questionReplyID(item)
+    }
+    func questionReplyID(_ item: String) -> [String: Any] {
+        let body = String(data: try! JSONSerialization.data(withJSONObject: [["answer": "Red", "questionItemId": item]]), encoding: .utf8)!
+        return ["type": "message", "role": "user", "content": [["type": "input_text", "text": "<send_user_message_question_reply>\(body)</send_user_message_question_reply>"]]]
+    }
+    func testCodexAsyncDeliveryRetainsWaitThroughOtherWork() {
+        let rows = codexRows([codexQuestion(), ["type": "function_call_output", "call_id": "q", "output": "{\"accepted\":true}"],
+                              ["type": "function_call", "name": "sleep", "call_id": "sleep"],
+                              ["type": "function_call_output", "call_id": "sleep"]])
+        for end in 1...rows.count {
+            XCTAssertEqual(SessionEvidence.codexEvidence(Array(rows.prefix(end)))?.state, "waiting")
+        }
+    }
+    func testCodexBlockingCompletionClearsWait() {
+        let evidence = SessionEvidence.codexEvidence(codexRows([codexQuestion(asynchronous: false),
+                                                               ["type": "function_call_output", "call_id": "q"]]))
+        XCTAssertEqual(evidence?.state, "working")
+        XCTAssertEqual(evidence?.clearsWaiting, true)
+    }
+    func testCodexStructuredRepliesClearOnlyAnsweredItems() {
+        var payloads = [codexQuestion(count: 2), codexQuestion("other"), questionReply("q")]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(payloads))?.state, "waiting")
+        payloads += [questionReply("q", index: 1), questionReply("unknown")]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(payloads))?.state, "waiting")
+        payloads += [questionReply("other")]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(payloads))?.state, "working")
+        let malformed: [String: Any] = ["type": "user_message", "message": "<send_user_message_question_reply>bad"]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), malformed]))?.state, "waiting")
+        for invalid in ["true", "-1", "0.0"] {
+            let item = "[\"request_user_input_async\",\"q\",\(invalid)]"
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), questionReplyID(item)]))?.state, "waiting")
+        }
+    }
+    func testCodexPlainReplyRemainsWorkingThroughOtherCalls() {
+        for reply: [String: Any] in [["type": "user_message", "message": "Red"],
+                                    ["type": "message", "role": "user", "content": [["type": "input_text", "text": "Red"]]]] {
+            let evidence = SessionEvidence.codexEvidence(codexRows([codexQuestion(), reply,
+                                                                   ["type": "function_call", "name": "Bash", "call_id": "work"],
+                                                                   ["type": "function_call_output", "call_id": "work"]]))
+            XCTAssertEqual(evidence?.state, "working")
+            XCTAssertEqual(evidence?.clearsWaiting, true)
+        }
+    }
+    func testCodexTerminalEventsCancelUnansweredBlockingQuestions() {
+        for end: [String: Any] in [["type": "task_complete"], ["type": "turn_aborted"],
+                                  ["type": "message", "role": "assistant", "phase": "final_answer"]] {
+            let question = codexQuestion(asynchronous: false)
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([question, end]))?.state, "idle")
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([question, end, ["type": "task_started"]]))?.state, "working")
+        }
+    }
+    func testCodexAsyncQuestionOutlivesItsTurnUntilAnswered() {
+        let asked = [codexQuestion(), ["type": "function_call_output", "call_id": "q", "output": "{\"accepted\":true}"],
+                     ["type": "function_call", "name": "sleep", "call_id": "sleep"], ["type": "function_call_output", "call_id": "sleep"],
+                     ["type": "message", "role": "assistant", "phase": "final_answer"], ["type": "task_complete"]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(asked))?.state, "waiting")
+        let injected: [String: Any] = ["type": "message", "role": "user", "content": [
+            ["type": "input_text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>x</INSTRUCTIONS>"],
+            ["type": "input_text", "text": "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"]]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows(asked + [["type": "task_started"], injected]))?.state, "waiting")
+        for answer: [[String: Any]] in [[questionReply("q")],
+                                        [["type": "task_started"], questionReply("q")],
+                                        [["type": "task_started"], ["type": "message", "role": "user", "content": [["type": "input_text", "text": "no"]]]]] {
+            let evidence = SessionEvidence.codexEvidence(codexRows(asked + answer))
+            XCTAssertEqual(evidence?.state, "working")
+            XCTAssertEqual(evidence?.clearsWaiting, true)
+        }
+    }
+    func testCodexInjectedContextDoesNotAnswerAQuestion() {
+        for text in SessionEvidence.injectedPrefixes {
+            let row: [String: Any] = ["type": "message", "role": "user", "content": [["type": "input_text", "text": "\(text) body"]]]
+            XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), row]))?.state, "waiting")
+        }
+        let mixed: [String: Any] = ["type": "message", "role": "user", "content": [
+            ["type": "input_text", "text": "<skill> <name>x</name>"], ["type": "input_text", "text": "Red"]]]
+        XCTAssertEqual(SessionEvidence.codexEvidence(codexRows([codexQuestion(), mixed]))?.state, "working")
+    }
+    func testCodexUnrelatedEvidenceCannotOverridePendingHook() {
+        var session = record("waiting")
+        session.agent = "codex"
+        let unrelated = Evidence(state: "working", date: Date(timeIntervalSince1970: 950))
+        XCTAssertEqual(rows([session], layout(), source: unrelated).first?.state, "waiting")
+        let answer = Evidence(state: "working", date: Date(timeIntervalSince1970: 950), clearsWaiting: true)
+        XCTAssertEqual(rows([session], layout(), source: answer).first?.state, "working")
+    }
+    func testCodexPermissionWaitYieldsToNewerWork() {
+        for message in ["permission: Bash", "permission"] {
+            var session = record("waiting")
+            session.agent = "codex"
+            session.message = message
+            let newer = Evidence(state: "working", date: Date(timeIntervalSince1970: 950))
+            XCTAssertEqual(rows([session], layout(), source: newer).first?.state, "working")
+        }
+    }
+    func testCodexRejectedAsyncDeliveryClearsWait() {
+        for (output, expected) in [("{\"accepted\":false}", "working"), ("{\"accepted\":true}", "waiting"),
+                                   ("{\"accepted\":0}", "waiting"), ("unknown", "waiting")] {
+            let evidence = SessionEvidence.codexEvidence(codexRows([codexQuestion(), ["type": "function_call_output", "call_id": "q", "output": output]]))
+            XCTAssertEqual(evidence?.state, expected)
+        }
     }
 
     let screen = CGRect(x: 0, y: 25, width: 1920, height: 1055)

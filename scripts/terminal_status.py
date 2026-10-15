@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ghostty_tabs
+import diagnostics
 
 STATE_DIR = Path(os.environ.get("GHOSTTY_AGENT_STATUS_DIR") or Path.home() / ".local" / "state" / "ghostty-agent-status")
 STATUS_DIR = STATE_DIR / "status"
@@ -71,7 +72,7 @@ INPUT_WINDOW_SECONDS = 10
 LOCK_WAIT_SECONDS = 2.0
 MESSAGE_MAX = 120
 PRUNE_AFTER_SECONDS = 24 * 3600
-# A probe that misses holds the shared title-probe lock for up to ~35 s, so one is not retried on every hook event.
+# A probe that misses holds the shared title-probe lock for seconds (~35 s on the slow listing), so it is not retried on every event.
 PROBE_BACKOFF_SECONDS = 300
 
 
@@ -88,11 +89,18 @@ def display_state(record: dict) -> str:
     return state
 
 
+def short_tool(name: str) -> str:
+    return name.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
+
+
+def question_indices(payload: dict) -> list[int]:
+    return list(range(max(1, len((payload.get("tool_input") or {}).get("questions") or []))))
+
+
 def state_for(payload: dict) -> tuple[str, str | None] | None:
     """(state, message) for a hook event, or None when the event says nothing about the state."""
     event = payload.get("hook_event_name")
     tool = payload.get("tool_name") or ""
-    short_tool = tool.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
     if event == "SessionStart":
         return "idle", None
     if event == "Stop":
@@ -103,9 +111,9 @@ def state_for(payload: dict) -> tuple[str, str | None] | None:
         return "done", None
     if event == "PermissionRequest":
         return "waiting", f"permission: {tool}" if tool else "permission"
-    if event == "PreToolUse" and short_tool in WAITING_TOOLS:
+    if event == "PreToolUse" and short_tool(tool) in WAITING_TOOLS:
         questions = (payload.get("tool_input") or {}).get("questions") or [{}]
-        return "waiting", (questions[0].get("question") or "question")[:MESSAGE_MAX]
+        return "waiting", (questions[0].get("question") or questions[0].get("title") or "question")[:MESSAGE_MAX]
     # A subagent's tool calls and its stop say nothing about whether the main agent is waiting on the user.
     if event == "SubagentStop" or (payload.get("agent_id") and event in TOOL_EVENTS):
         return None
@@ -121,51 +129,133 @@ def state_for(payload: dict) -> tuple[str, str | None] | None:
 
 
 def call_key(payload: dict) -> str:
-    """PermissionRequest carries no tool_use_id, so a call is keyed by its tool and input, which every tool event carries."""
+    if payload.get("tool_use_id"):
+        return f"call:{payload['tool_use_id']}"
+    return input_key(payload)
+
+
+def input_key(payload: dict) -> str:
     tool = payload.get("tool_name")
     if not tool:
         return "permission"
     tool_input = payload.get("tool_input")
-    # Codex adds description only to Bash permission requests, not their completion events.
     if tool == "Bash" and isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str):
         tool_input = {k: v for k, v in tool_input.items() if k != "description"}
     body = json.dumps(tool_input, sort_keys=True, default=str)
     return f"{tool}:{hashlib.sha1(body.encode()).hexdigest()[:12]}"
 
 
+def delivery_rejected(response) -> bool:
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except (ValueError, TypeError):
+            return False
+    return isinstance(response, dict) and response.get("accepted") is False
+
+
+def question_replies(prompt: str) -> dict[str, set[int]] | None:
+    if not isinstance(prompt, str) or not prompt.strip().startswith("<send_user_message_question_reply>"):
+        return None
+    replies: dict[str, set[int]] = {}
+    try:
+        body = prompt.strip().removeprefix("<send_user_message_question_reply>").removesuffix("</send_user_message_question_reply>")
+        rows = json.loads(body)
+        if not isinstance(rows, list):
+            return replies
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                identity = json.loads(row.get("questionItemId", ""))
+            except (ValueError, TypeError):
+                continue
+            if (isinstance(identity, list) and len(identity) == 3 and isinstance(identity[0], str)
+                    and short_tool(identity[0]) == "request_user_input_async"
+                    and isinstance(identity[1], str) and type(identity[2]) is int and identity[2] >= 0):
+                replies.setdefault(identity[1], set()).add(identity[2])
+    except (ValueError, TypeError):
+        pass
+    return replies
+
+
 def transition(old: dict, payload: dict, tracking: dict) -> tuple[str, str | None] | None:
     event = payload.get("hook_event_name")
     actor = str(payload.get("agent_id") or "main")
     key = f"{actor}:{call_key(payload)}"
+    fallback = f"{actor}:{input_key(payload)}"
     tracking.setdefault("main_state", old.get("state") if old.get("state") in {"working", "idle", "done"} else "idle")
     pending = tracking.setdefault("pending", {})
     before_pending = dict(pending)
     before_message = tracking.get("main_message")
+    calls = tracking.setdefault("call_inputs", {})
+    questions = tracking.setdefault("async_questions", {})
+    tool = short_tool(str(payload.get("tool_name") or ""))
     change = state_for(payload)
     if change is None and event not in {"SubagentStop", "PostToolUse", "PostToolUseFailure"}:
         return None
     if old.get("state") == "done" and event not in {"SessionStart", "UserPromptSubmit"}:
         return None
+    if event in {"PreToolUse", "PermissionRequest"} and payload.get("tool_use_id"):
+        calls[key] = fallback
+    if event == "PermissionRequest" and not payload.get("tool_use_id"):
+        matches = [known for known, original in calls.items() if original == fallback]
+        if len(matches) == 1:
+            key = matches[0]
+
+    def forget(keys):
+        for waiting in keys:
+            pending.pop(waiting, None)
+            calls.pop(waiting, None)
+            questions.pop(waiting, None)
+
     if event in {"SessionStart", "SessionEnd"}:
         pending.clear()
+        calls.clear()
+        questions.clear()
     if event == "SubagentStop":
         if actor == "main":
             return None
-        for waiting in list(pending):
-            if waiting.startswith(f"{actor}:"):
-                pending.pop(waiting)
+        forget([waiting for waiting in set(pending) | set(calls) if waiting.startswith(f"{actor}:")])
         if tracking["main_state"] == "idle" and "background_tasks" in payload:
             tracking["main_message"] = background_message(payload)
     if event in {"UserPromptSubmit", "Stop", "StopFailure"}:
-        for waiting in list(pending):
-            if waiting.startswith("main:"):
-                pending.pop(waiting)
+        replies = question_replies(payload.get("prompt")) if event == "UserPromptSubmit" else None
+        if replies is None:
+            # An asynchronous question outlives the turn that asked it: only its answer or a new prompt ends it.
+            kept = set(questions) if event != "UserPromptSubmit" else set()
+            forget([waiting for waiting in set(pending) | set(calls) if waiting.startswith("main:") and waiting not in kept])
+        else:
+            for call, answered in replies.items():
+                matches = [waiting for waiting in questions if waiting.endswith(f":call:{call}")]
+                if len(matches) != 1:
+                    continue
+                waiting = matches[0]
+                remaining = set(questions[waiting]) - answered
+                if remaining:
+                    questions[waiting] = sorted(remaining)
+                else:
+                    forget([waiting])
     if event in {"PostToolUse", "PostToolUseFailure"}:
-        pending.pop(key, None)
+        rejected = tool == "request_user_input_async" and delivery_rejected(payload.get("tool_response"))
+        if event == "PostToolUse" and tool == "request_user_input_async" and fallback in pending and key not in questions and not rejected:
+            pending[key] = pending.pop(fallback)
+            calls[key] = fallback
+            questions[key] = questions.pop(fallback, None) or question_indices(payload)
+        if event != "PostToolUse" or key not in questions or rejected:
+            original = calls.get(key, fallback)
+            ambiguous = any(known != key and value == original for known, value in calls.items())
+            forget([key])
+            if not ambiguous:
+                forget([original])
+            elif original in pending:
+                diagnostics.emit("hook.pending_ambiguous", request_id=original, pending_count=len(pending), reason="shared_input")
         pending.pop(f"{actor}:permission", None)
     if change and change[0] == "waiting":
         if event != "Notification" or not pending:
             pending[key] = change[1]
+        if event == "PreToolUse" and tool == "request_user_input_async":
+            questions[key] = question_indices(payload)
     elif change and actor == "main":
         tracking["main_state"] = change[0]
         if event != "Notification" or payload.get("notification_type") != "idle_prompt":
@@ -308,6 +398,7 @@ def locked(name: str):
     path = WORK_DIR / "locks" / f"{name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:
+        started = time.monotonic()
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         held = False
         while not held:
@@ -316,9 +407,11 @@ def locked(name: str):
                 held = True
             except OSError:
                 if time.monotonic() > deadline:
+                    diagnostics.emit("lock.timeout", call_key=name, elapsed_ms=(time.monotonic() - started) * 1000)
                     raise TimeoutError(f"status lock busy: {name}")
                 time.sleep(0.02)
         try:
+            diagnostics.emit("lock.acquired", call_key=name, elapsed_ms=(time.monotonic() - started) * 1000)
             yield
         finally:
             if held:
@@ -466,6 +559,17 @@ def codex_thread_name(session_id: str) -> str | None:
 
 
 def update(agent: str, payload: dict) -> None:
+    with diagnostics.scope(agent, payload.get("session_id")):
+        diagnostics.emit("hook.received", hook_event=payload.get("hook_event_name"),
+                         actor_id=payload.get("agent_id") or "main", tool_name=payload.get("tool_name"),
+                         call_id=payload.get("tool_use_id"), call_key=call_key(payload),
+                         request_id=f"{payload.get('agent_id') or 'main'}:{call_key(payload)}",
+                         tool_input_present="tool_input" in payload, tool_use_id_present="tool_use_id" in payload)
+        with diagnostics.span("hook.update"):
+            _update(agent, payload)
+
+
+def _update(agent: str, payload: dict) -> None:
     """Hook entry: write the status file now; leave Ghostty to a detached worker when the tab must change."""
     session_id = str(payload.get("session_id") or "")
     if not session_id:
@@ -474,7 +578,8 @@ def update(agent: str, payload: dict) -> None:
     # git can take seconds on a loaded machine; holding the lock through it made parallel hooks time out.
     peek = read_status(agent, session_id)
     git_cwd = str(payload.get("cwd") or peek.get("cwd") or os.getcwd())
-    git = git_info(git_cwd) if event in GIT_EVENTS or git_cwd != peek.get("cwd") or not peek.get("color") else None
+    with diagnostics.span("hook.git"):
+        git = git_info(git_cwd) if event in GIT_EVENTS or git_cwd != peek.get("cwd") or not peek.get("color") else None
     with locked(_key(agent, session_id)):
         old = read_status(agent, session_id)
         tracking_path = WORK_DIR / "events" / f"{_key(agent, session_id)}.json"
@@ -483,10 +588,16 @@ def update(agent: str, payload: dict) -> None:
         if agent == "codex" and tracking.get("tab") is None:
             tracking["tab"] = codex_tab(payload, session_id)
         if agent == "codex" and not tracking.get("tab"):
+            diagnostics.emit("hook.skipped", reason="no_tui_rollout")
             status_path(agent, session_id).unlink(missing_ok=True)
             _write_json(tracking_path, tracking)
             return
+        before_pending = list(tracking.get("pending", {}))
         change = transition(old, payload, tracking)
+        diagnostics.emit("hook.transition", old_state=old.get("state"), state=change[0] if change else old.get("state"),
+                         pending_count=len(tracking.get("pending", {})), pending_keys=list(tracking.get("pending", {})),
+                         changed=change is not None, reason="transition" if change else "ignored_event")
+        diagnostics.emit("hook.pending_before", pending_count=len(before_pending), pending_keys=before_pending)
         if change is None:
             return
         state, message = change
@@ -501,12 +612,15 @@ def update(agent: str, payload: dict) -> None:
         elif not pid_alive(old.get("pid")):
             owner = process_owner()
             if owner is None:
+                diagnostics.emit("hook.skipped", reason="no_process_owner")
                 return
             pid, _tty, daemon = owner
             if agent == "codex" and daemon:
                 if not codex_tuis():
+                    diagnostics.emit("hook.skipped", reason="no_codex_tui")
                     return
             elif os.environ.get("TERM_PROGRAM", "").casefold() != "ghostty":
+                diagnostics.emit("hook.skipped", reason="outside_ghostty")
                 return
             record.update(pid=pid, ghostty_terminal_id=None)
         cwd = str(payload.get("cwd") or old.get("cwd") or os.getcwd())
@@ -522,16 +636,22 @@ def update(agent: str, payload: dict) -> None:
             record["title"] = codex_thread_name(session_id) or record["title"]
         write_status(record)
         _write_json(tracking_path, tracking)
+        diagnostics.emit("status.written", state=state, terminal_id=record.get("ghostty_terminal_id"))
     if (event in RETITLE_EVENTS or state != old.get("state") or display_state(record) != display_state(old)
             or not record.get("ghostty_terminal_id")
             or record.get("color") != old.get("color")):
         spawn_worker(agent, session_id, event)
+    else:
+        diagnostics.emit("worker.skipped", reason="no_title_change")
 
 
 def spawn_worker(agent: str, session_id: str, event: str) -> None:
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "apply", agent, session_id, event],
+    env = dict(os.environ)
+    env["GHOSTTY_AGENT_STATUS_TRACE_ID"] = diagnostics.CONTEXT.get().get("trace_id", "")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "apply", agent, session_id, event], env=env,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
+    diagnostics.emit("worker.spawned", hook_event=event)
 
 
 def locate(record: dict, event: str) -> tuple[int | None, str | None]:
@@ -566,6 +686,10 @@ def probe_miss_path(agent: str, session_id: str) -> Path:
     return WORK_DIR / "probe-misses" / f"{_key(agent, session_id)}.json"
 
 
+def stop_miss_path(agent: str, session_id: str) -> Path:
+    return WORK_DIR / "probe-misses" / f"{_key(agent, session_id)}.stop"
+
+
 def _modified_within(path: Path, seconds: float) -> bool:
     try:
         return time.time() - path.stat().st_mtime < seconds
@@ -597,6 +721,7 @@ def show(terminal_id: str) -> None:
         terminal = ghostty_tabs.find(terminal_id)
         record = session_on(terminal_id)
         if terminal is None or record is None:
+            diagnostics.emit("title.skipped", terminal_id=terminal_id, reason="terminal_or_record_missing")
             return
         agent, session_id = record["agent"], record["session_id"]
         title = agent_title(terminal.title) if agent == "claude" else codex_thread_name(session_id)
@@ -612,8 +737,18 @@ def show(terminal_id: str) -> None:
             base = f"{base} · {labels['milestone']}"
         wanted = compose(display_state(record), record.get("color"), base)
         shown = terminal.tab_title.removeprefix(BELL)
+        observed = next((state for state, glyph in STATE_GLYPH.items() if shown.startswith(glyph)), "unknown")
+        diagnostics.emit("title.inspect", terminal_id=terminal_id, state=record.get("state"),
+                         observed_state=observed, session_id=record.get("session_id"),
+                         reported_ms=diagnostics.date_ms(record.get("updated_at")))
         if wanted != shown:
-            ghostty_tabs.set_tab_title(terminal_id, wanted)
+            with diagnostics.span("title.apply", terminal_id=terminal_id):
+                ghostty_tabs.set_tab_title(terminal_id, wanted)
+            diagnostics.emit("title.applied", terminal_id=terminal_id, state=record.get("state"),
+                             session_id=record.get("session_id"))
+        else:
+            diagnostics.emit("title.unchanged", terminal_id=terminal_id, state=record.get("state"),
+                             session_id=record.get("session_id"))
 
 
 def prune() -> None:
@@ -627,7 +762,8 @@ def prune() -> None:
                 kept_terminals.add(record.get("ghostty_terminal_id"))
                 continue
             for stale in (path, WORK_DIR / "labels" / path.name, WORK_DIR / "events" / path.name,
-                          WORK_DIR / "probe-misses" / path.name, WORK_DIR / "locks" / f"{path.stem}.lock"):
+                          WORK_DIR / "probe-misses" / path.name, WORK_DIR / "probe-misses" / f"{path.stem}.stop",
+                          WORK_DIR / "locks" / f"{path.stem}.lock"):
                 stale.unlink(missing_ok=True)
     stale_files = [lock for lock in (WORK_DIR / "locks").glob("tab-*.lock") if lock.stem[4:] not in kept_terminals]
     stale_files += list(STATUS_DIR.glob(".*.tmp"))
@@ -638,11 +774,21 @@ def prune() -> None:
 
 
 def apply(agent: str, session_id: str, event: str) -> None:
+    trace_id = os.environ.get("GHOSTTY_AGENT_STATUS_TRACE_ID", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", trace_id):
+        trace_id = None
+    with diagnostics.scope(agent, session_id, trace_id):
+        with diagnostics.span("worker.apply", hook_event=event):
+            _apply(agent, session_id, event)
+
+
+def _apply(agent: str, session_id: str, event: str) -> None:
     """Worker: resolve the session's terminal if needed, then retitle its tab."""
     if event == "SessionStart":
         prune()
     record = read_status(agent, session_id)
     if not record:
+        diagnostics.emit("worker.skipped", reason="record_missing")
         return
     terminal_id = record.get("ghostty_terminal_id")
     if not terminal_id:
@@ -655,17 +801,27 @@ def apply(agent: str, session_id: str, event: str) -> None:
         # Codex redraws its spinner title faster than a tty probe can be read back, so its own title goes first.
         terminal_id = codex_terminal_by_name(session_id) if agent == "codex" else None
         missed = probe_miss_path(agent, session_id)
-        if not terminal_id and tty and not _modified_within(missed, PROBE_BACKOFF_SECONDS):
-            terminal_id = ghostty_tabs.terminals_for_ttys([tty]).get(tty)
+        # A finished turn stops the agent's spinner, the one point a probe title reliably stays put, so Stop keeps its own backoff.
+        backoff = stop_miss_path(agent, session_id) if event == "Stop" else missed
+        if not terminal_id and tty and not _modified_within(backoff, PROBE_BACKOFF_SECONDS):
+            def resolved_meanwhile() -> str | None:
+                if found := read_status(agent, session_id).get("ghostty_terminal_id"):
+                    return found
+                return "" if _modified_within(backoff, PROBE_BACKOFF_SECONDS) else None
+
+            terminal_id = ghostty_tabs.terminals_for_ttys([tty], cached=resolved_meanwhile).get(tty)
             if not terminal_id:
-                missed.parent.mkdir(parents=True, exist_ok=True)
-                missed.touch()
+                for marker in {missed, backoff}:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.touch()
         if not terminal_id:
+            diagnostics.emit("worker.skipped", reason="terminal_unresolved")
             return
         with locked(_key(agent, session_id)):
             record = read_status(agent, session_id)
             record["ghostty_terminal_id"] = terminal_id
             write_status(record)
+            diagnostics.emit("terminal.resolved", terminal_id=terminal_id)
         before = ghostty_tabs.find(terminal_id)
         adopted = foreign_override(before) if before else ""
         if adopted and not label_path(agent, session_id).exists():
