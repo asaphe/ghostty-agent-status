@@ -1,6 +1,5 @@
 import sys
 import tempfile
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +21,18 @@ class ListingTests(unittest.TestCase):
         self.assertEqual((first.id, first.frontmost, first.title_override), ("T1", True, "PR 12 gate"))
         self.assertEqual((second.frontmost, second.title_override), (False, ""))
 
+    def test_one_bulk_query_lists_terminals(self):
+        raw = g.FIELD.join(["T1", "tab1", "w1", "zsh", "zsh", "/", "false"]) + g.ROW
+        with patch.object(g, "osascript", return_value=raw) as call:
+            self.assertEqual([t.id for t in g.terminals()], ["T1"])
+        self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT])
+
+    def test_a_layout_change_during_the_bulk_query_falls_back_to_the_per_terminal_listing(self):
+        raw = g.FIELD.join(["T1", "tab1", "w1", "zsh", "zsh", "/", "false"]) + g.ROW
+        with patch.object(g, "osascript", side_effect=[g.LAYOUT_CHANGED, raw]) as call:
+            self.assertEqual([t.id for t in g.terminals()], ["T1"])
+        self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT, g.LIST_SCRIPT])
+
 
 class TtyProbeTests(unittest.TestCase):
     def setUp(self):
@@ -34,10 +45,6 @@ class TtyProbeTests(unittest.TestCase):
         self.titles = {"/dev/ttys001": "claude", "/dev/ttys002": "codex"}
         self.ids = {"/dev/ttys001": "T1", "/dev/ttys002": "T2"}
         self.writes = []
-        scratch = tempfile.TemporaryDirectory()
-        self.addCleanup(scratch.cleanup)
-        open_lock = g.os.open
-        patch.object(g.os, "open", side_effect=lambda path, *args: open_lock(str(Path(scratch.name) / "probe.lock"), *args)).start()
         patch.object(g.time, "sleep").start()
         self.addCleanup(patch.stopall)
 
@@ -58,6 +65,21 @@ class TtyProbeTests(unittest.TestCase):
         with patch.object(g.diagnostics, "emit") as emit, patch.object(g, "_probe_ttys", return_value={"tty": "T1"}):
             self.assertEqual(g.terminals_for_ttys(["tty"]), {"tty": "T1"})
         self.assertEqual([c.args[0] for c in emit.call_args_list], ["probe.lock_wait", "probe.lock_acquired"])
+
+    def test_a_terminal_resolved_while_waiting_for_the_lock_skips_the_probe(self):
+        with patch.object(g, "_probe_ttys") as probe:
+            self.assertEqual(g.terminals_for_ttys(["/dev/ttys001"], cached=lambda: "T1"), {"/dev/ttys001": "T1"})
+        probe.assert_not_called()
+
+    def test_an_unresolved_cache_still_probes(self):
+        with patch.object(g, "_probe_ttys", return_value={"/dev/ttys001": "T1"}) as probe:
+            self.assertEqual(g.terminals_for_ttys(["/dev/ttys001"], cached=lambda: None), {"/dev/ttys001": "T1"})
+        probe.assert_called_once_with(["/dev/ttys001"])
+
+    def test_a_multi_tty_probe_ignores_the_cache(self):
+        with patch.object(g, "_probe_ttys", return_value={}) as probe:
+            g.terminals_for_ttys(["/dev/ttys001", "/dev/ttys002"], cached=lambda: "T1")
+        probe.assert_called_once()
 
     def test_title_overwritten_before_the_read_is_probed_again(self):
         def write(tty, title):

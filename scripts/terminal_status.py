@@ -788,7 +788,8 @@ def _apply(agent: str, session_id: str, event: str) -> None:
         terminal_id = codex_terminal_by_name(session_id) if agent == "codex" else None
         missed = probe_miss_path(agent, session_id)
         if not terminal_id and tty and not _modified_within(missed, PROBE_BACKOFF_SECONDS):
-            terminal_id = ghostty_tabs.terminals_for_ttys([tty]).get(tty)
+            terminal_id = ghostty_tabs.terminals_for_ttys(
+                [tty], cached=lambda: read_status(agent, session_id).get("ghostty_terminal_id")).get(tty)
             if not terminal_id:
                 missed.parent.mkdir(parents=True, exist_ok=True)
                 missed.touch()

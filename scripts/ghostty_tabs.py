@@ -16,6 +16,7 @@ import os
 import secrets
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,11 +102,50 @@ on run argv
 end run
 """
 
+# Reads each property for every terminal in one Apple event instead of one event per terminal.
+LAYOUT_CHANGED = "layout-changed"
+BULK_LIST_SCRIPT = """
+on run argv
+  set fs to character id 31
+  set rs to character id 30
+  tell application "Ghostty"
+    set frontId to ""
+    try
+      set frontId to id of focused terminal of selected tab of front window
+    end try
+    set wids to id of every window
+    set tids to id of every tab of every window
+    set sids to id of every terminal of every tab of every window
+    set tnames to name of every tab of every window
+    set snames to name of every terminal of every tab of every window
+    set sdirs to working directory of every terminal of every tab of every window
+    set widsAfter to id of every window
+    set tidsAfter to id of every tab of every window
+    set sidsAfter to id of every terminal of every tab of every window
+  end tell
+  if wids is not widsAfter or tids is not tidsAfter or sids is not sidsAfter then return "layout-changed"
+  set out to ""
+  repeat with wi from 1 to count of wids
+    repeat with ti from 1 to count of item wi of tids
+      repeat with si from 1 to count of item ti of item wi of sids
+        set s to item si of item ti of item wi of sids
+        set out to out & s & fs & (item ti of item wi of tids) & fs & (item wi of wids) & fs & (item si of item ti of item wi of snames) & fs & (item ti of item wi of tnames) & fs & (item si of item ti of item wi of sdirs) & fs & (s is frontId) & rs
+      end repeat
+    end repeat
+  end repeat
+  return out
+end run
+"""
+
 
 def terminals() -> list[Terminal]:
     started = time.monotonic()
     found = []
-    for row in osascript(LIST_SCRIPT).split(ROW):
+    out = osascript(BULK_LIST_SCRIPT)
+    if out == LAYOUT_CHANGED:
+        diagnostics.emit("ghostty.list_fallback", reason="layout_changed")
+        out = osascript(LIST_SCRIPT)
+    for row in out.split(ROW):
         parts = row.split(FIELD)
         if len(parts) == 7:
             found.append(Terminal(*parts[:6], frontmost=parts[6] == "true"))
@@ -254,8 +294,12 @@ def _write_title(tty: str, title: str) -> bool:
         return False
 
 
-def terminals_for_ttys(ttys: list[str]) -> dict[str, str]:
-    """Serialize title probes so concurrent callers never save another caller's nonce as a title."""
+def terminals_for_ttys(ttys: list[str], cached: Callable[[], str | None] | None = None) -> dict[str, str]:
+    """Serialize title probes so concurrent callers never save another caller's nonce as a title.
+
+    CACHED, asked once the lock is held, returns a terminal another caller resolved while this one
+    waited; a single tty then maps to it without a second probe.
+    """
     if not ttys:
         return {}
     path = f"/tmp/ghostty-title-probe-{os.getuid()}.lock"
@@ -274,6 +318,11 @@ def terminals_for_ttys(ttys: list[str]) -> dict[str, str]:
                     diagnostics.emit("probe.lock_timeout", elapsed_ms=(time.monotonic() - started) * 1000)
                     raise GhosttyError("another terminal title probe is in progress")
                 time.sleep(0.05)
+        if cached is not None and len(set(ttys)) == 1:
+            terminal_id = cached()
+            if terminal_id:
+                diagnostics.emit("probe.skipped", reason="resolved_while_waiting")
+                return {ttys[0]: terminal_id}
         return _probe_ttys(ttys)
 
 

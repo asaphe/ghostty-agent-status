@@ -114,6 +114,36 @@ final class StatusStore: ObservableObject {
 }
 
 enum Ghostty {
+    static let layoutChanged = "layout-changed"
+
+    // Reads each property for every terminal in one Apple event instead of one event per terminal.
+    static let bulkTabLayoutScript = """
+    set sep to character id 31
+    set rowSep to character id 30
+    with timeout of 8 seconds
+      tell application "Ghostty"
+        set wids to id of every window
+        set wnames to name of every window
+        set sids to id of every terminal of every tab of every window
+        set snames to name of every terminal of every tab of every window
+        set sdirs to working directory of every terminal of every tab of every window
+        set widsAfter to id of every window
+        set sidsAfter to id of every terminal of every tab of every window
+      end tell
+    end timeout
+    if wids is not widsAfter or sids is not sidsAfter then return "\(layoutChanged)"
+    set out to ""
+    repeat with wi from 1 to count of wids
+      set wid to item wi of wids
+      repeat with ti from 1 to count of item wi of sids
+        repeat with si from 1 to count of item ti of item wi of sids
+          set out to out & (item si of item ti of item wi of sids) & sep & wid & sep & ti & sep & si & sep & (item si of item ti of item wi of snames) & sep & (item si of item ti of item wi of sdirs) & sep & (item wi of wnames) & rowSep
+        end repeat
+      end repeat
+    end repeat
+    return out
+    """
+
     static let tabLayoutScript = """
     set out to ""
     set sep to character id 31
@@ -141,9 +171,19 @@ enum Ghostty {
         let started = ProcessInfo.processInfo.systemUptime
         Diagnostics.emit("sidebar.ghostty_start")
         defer { Diagnostics.emit("sidebar.ghostty_end", fields: ["elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000]) }
+        guard var text = runScript(bulkTabLayoutScript) else { return nil }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines) == layoutChanged {
+            Diagnostics.emit("sidebar.ghostty_fallback", fields: ["reason": "layout_changed"])
+            guard let fallback = runScript(tabLayoutScript) else { return nil }
+            text = fallback
+        }
+        return parseLayout(text)
+    }
+
+    static func runScript(_ script: String) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", tabLayoutScript]
+        process.arguments = ["-e", script]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
@@ -165,6 +205,10 @@ enum Ghostty {
             Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "nonzero_or_invalid_output", "returncode": process.terminationStatus])
             return nil
         }
+        return text
+    }
+
+    static func parseLayout(_ text: String) -> TabLayout? {
         var layout = TabLayout()
         var tabs: [String: Set<Int>] = [:]
         for line in text.components(separatedBy: "\u{1e}") where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
