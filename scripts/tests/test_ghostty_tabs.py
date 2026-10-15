@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +25,12 @@ class ListingTests(unittest.TestCase):
 
 class TtyProbeTests(unittest.TestCase):
     def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        original_open = g.os.open
+        patch.object(g.os, "open", side_effect=lambda path, flags, mode=0o777:
+                     original_open(str(Path(scratch.name) / "probe.lock") if str(path).startswith("/tmp/ghostty-title-probe-")
+                                   else path, flags, mode)).start()
         self.titles = {"/dev/ttys001": "claude", "/dev/ttys002": "codex"}
         self.ids = {"/dev/ttys001": "T1", "/dev/ttys002": "T2"}
         self.writes = []
@@ -36,6 +43,21 @@ class TtyProbeTests(unittest.TestCase):
 
     def listing(self):
         return [term(self.ids[tty], title) for tty, title in self.titles.items()]
+
+    def test_probe_lock_timeout_is_traced_before_any_title_write(self):
+        with patch.object(g.fcntl, "flock", side_effect=BlockingIOError), \
+                patch.object(g.time, "monotonic", side_effect=[0, 46, 46]), \
+                patch.object(g.diagnostics, "emit") as emit, patch.object(g, "_probe_ttys") as probe:
+            with self.assertRaises(g.GhosttyError):
+                g.terminals_for_ttys(["/dev/ttys001"])
+        probe.assert_not_called()
+        self.assertEqual([c.args[0] for c in emit.call_args_list], ["probe.lock_wait", "probe.lock_timeout"])
+        self.assertEqual(emit.call_args_list[-1].kwargs["elapsed_ms"], 46000)
+
+    def test_probe_lock_acquisition_is_traced_without_changing_result(self):
+        with patch.object(g.diagnostics, "emit") as emit, patch.object(g, "_probe_ttys", return_value={"tty": "T1"}):
+            self.assertEqual(g.terminals_for_ttys(["tty"]), {"tty": "T1"})
+        self.assertEqual([c.args[0] for c in emit.call_args_list], ["probe.lock_wait", "probe.lock_acquired"])
 
     def test_title_overwritten_before_the_read_is_probed_again(self):
         def write(tty, title):

@@ -64,7 +64,12 @@ final class StatusStore: ObservableObject {
     func windowId(titled title: String) -> String? { layout.windowId(titled: title) }
 
     func refreshLayout() {
-        guard !layoutInFlight else { return }
+        guard !layoutInFlight else {
+            Diagnostics.emit("sidebar.refresh_skipped", fields: ["reason": "in_flight"])
+            return
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        Diagnostics.emit("sidebar.refresh_start")
         layoutInFlight = true
         let previous = layout
         let directory = directory
@@ -78,6 +83,7 @@ final class StatusStore: ObservableObject {
             let records = (urls ?? []).filter { $0.pathExtension == "json" }.compactMap {
                 try? decoder.decode(SessionStatus.self, from: Data(contentsOf: $0))
             }
+            Diagnostics.emit("sidebar.status_read", fields: ["record_count": records.count, "elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000])
             reader.refreshIndex()
             let live = Reconcile.sessions(records, layout: fresh ?? previous, names: reader.codexNames,
                                           evidence: { reader.evidence(agent: $0, id: $1) })
@@ -94,6 +100,12 @@ final class StatusStore: ObservableObject {
                     }
                     let groups = self.group(live)
                     if groups != self.groups { self.groups = groups }
+                    Diagnostics.emit("sidebar.published", fields: ["row_count": live.count, "elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000])
+                    for row in live {
+                        var fields: [String: Any] = ["session_id": row.sessionId, "state": row.state]
+                        if let id = row.ghosttyTerminalId { fields["terminal_id"] = id }
+                        Diagnostics.emit("sidebar.row", agent: row.agent, fields: fields)
+                    }
                 }
             }
         }
@@ -126,26 +138,41 @@ enum Ghostty {
     """
 
     static func tabLayout() -> TabLayout? {
+        let started = ProcessInfo.processInfo.systemUptime
+        Diagnostics.emit("sidebar.ghostty_start")
+        defer { Diagnostics.emit("sidebar.ghostty_end", fields: ["elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000]) }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", tabLayoutScript]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch {
+            Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "launch_failed"])
+            return nil
+        }
         let watchdog = DispatchWorkItem {
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            if process.isRunning {
+                Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "watchdog_timeout"])
+                kill(process.processIdentifier, SIGKILL)
+            }
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10, execute: watchdog)
         defer { watchdog.cancel() }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return nil }
+        guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
+            Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "nonzero_or_invalid_output", "returncode": process.terminationStatus])
+            return nil
+        }
         var layout = TabLayout()
         var tabs: [String: Set<Int>] = [:]
         for line in text.components(separatedBy: "\u{1e}") where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let f = line.components(separatedBy: "\u{1f}")
-            guard f.count == 7, let tab = Int(f[2]), let split = Int(f[3]) else { return nil }
+            guard f.count == 7, let tab = Int(f[2]), let split = Int(f[3]) else {
+                Diagnostics.emit("sidebar.ghostty_error", fields: ["reason": "malformed_row"])
+                return nil
+            }
             layout.places[f[0]] = TerminalPlace(windowId: f[1], tabIndex: tab, splitIndex: split, title: f[4], cwd: f[5])
             layout.windowNames[f[1]] = f[6]
             if layout.frontWindowId == nil { layout.frontWindowId = f[1] }
@@ -870,7 +897,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct SidebarApp {
     @MainActor
     static func main() throws {
-        if CommandLine.arguments.contains("--snapshot") {
+        if let index = CommandLine.arguments.firstIndex(of: "--observe-status") {
+    guard CommandLine.arguments.indices.contains(index + 1),
+          let seconds = Double(CommandLine.arguments[index + 1]), (1...600).contains(seconds) else {
+        fputs("usage: GhosttySidebar --observe-status <seconds: 1...600>\n", stderr)
+        exit(2)
+    }
+    MainActor.assumeIsolated {
+        Diagnostics.emit("sidebar.observer_start")
+        let store = StatusStore()
+        store.refreshLayout()
+        let timer = Timer(timeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { store.refreshLayout() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        timer.invalidate()
+        Diagnostics.emit("sidebar.observer_end")
+    }
+} else if CommandLine.arguments.contains("--snapshot") {
             guard let layout = Ghostty.tabLayout() else {
                 fputs("Ghostty lookup failed\n", stderr)
                 exit(1)

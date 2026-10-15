@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import diagnostics
+
 OSASCRIPT_TIMEOUT_SECONDS = 20
 PROBE_ROUNDS = 3
 PROBE_POLLS = 5
@@ -39,13 +41,22 @@ def in_ghostty() -> bool:
 
 def osascript(script: str, *args: str) -> str:
     """Arguments reach the script as `argv`, never spliced into its source."""
+    started = time.monotonic()
+    diagnostics.emit("ghostty.call_start")
     try:
         out = subprocess.run(["osascript", "-", *args], input=script, capture_output=True, text=True,
                              timeout=OSASCRIPT_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired as exc:
+        diagnostics.emit("ghostty.call_error", reason="timeout", elapsed_ms=(time.monotonic() - started) * 1000)
         raise GhosttyError("Ghostty AppleScript call timed out") from exc
+    except OSError as exc:
+        diagnostics.emit("ghostty.call_error", error_type=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
+        raise
     if out.returncode != 0:
+        diagnostics.emit("ghostty.call_error", reason="nonzero_exit", returncode=out.returncode,
+                         elapsed_ms=(time.monotonic() - started) * 1000)
         raise GhosttyError(f"Ghostty AppleScript failed: {out.stderr.strip()[:200]}")
+    diagnostics.emit("ghostty.call_end", returncode=out.returncode, elapsed_ms=(time.monotonic() - started) * 1000)
     return out.stdout.rstrip("\n")
 
 
@@ -92,11 +103,13 @@ end run
 
 
 def terminals() -> list[Terminal]:
+    started = time.monotonic()
     found = []
     for row in osascript(LIST_SCRIPT).split(ROW):
         parts = row.split(FIELD)
         if len(parts) == 7:
             found.append(Terminal(*parts[:6], frontmost=parts[6] == "true"))
+    diagnostics.emit("ghostty.list", row_count=len(found), elapsed_ms=(time.monotonic() - started) * 1000)
     return found
 
 
@@ -248,13 +261,17 @@ def terminals_for_ttys(ttys: list[str]) -> dict[str, str]:
     path = f"/tmp/ghostty-title-probe-{os.getuid()}.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as lock:
-        deadline = time.monotonic() + PROBE_LOCK_WAIT_SECONDS
+        started = time.monotonic()
+        diagnostics.emit("probe.lock_wait")
+        deadline = started + PROBE_LOCK_WAIT_SECONDS
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                diagnostics.emit("probe.lock_acquired", elapsed_ms=(time.monotonic() - started) * 1000)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
+                    diagnostics.emit("probe.lock_timeout", elapsed_ms=(time.monotonic() - started) * 1000)
                     raise GhosttyError("another terminal title probe is in progress")
                 time.sleep(0.05)
         return _probe_ttys(ttys)
@@ -266,6 +283,7 @@ def _probe_ttys(ttys: list[str]) -> dict[str, str]:
     A program that sets its own title (Claude's spinner, Codex at startup) can overwrite a probe
     title before it is read, so titles are polled and unmatched ttys are probed again.
     """
+    diagnostics.emit("probe.start", row_count=len(ttys))
     pending = sorted(set(ttys))
     if not pending:
         return {}
@@ -297,6 +315,7 @@ def _probe_ttys(ttys: list[str]) -> dict[str, str]:
             for t in terminals():
                 if t.title in nonces and t.id in before:
                     _write_title(nonces[t.title], before[t.id])
+    diagnostics.emit("probe.end", row_count=len(found), matched=bool(found))
     return found
 
 

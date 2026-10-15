@@ -10,6 +10,7 @@ func timestamp(_ value: String?) -> Date? {
 struct Evidence: Equatable {
     let state: String
     let date: Date
+    var clearsWaiting = false
 }
 
 enum SessionEvidence {
@@ -38,19 +39,119 @@ enum SessionEvidence {
         let event = payload["type"] as? String ?? ""
         if type == "event_msg" {
             if ["task_complete", "turn_aborted"].contains(event) { return Evidence(state: "idle", date: date) }
-            if ["task_started", "user_message"].contains(event) { return Evidence(state: "working", date: date) }
+            if ["task_started", "user_message"].contains(event) { return Evidence(state: "working", date: date, clearsWaiting: event == "user_message") }
         }
         if type == "response_item" {
             if event == "message", payload["role"] as? String == "assistant", payload["phase"] as? String == "final_answer" {
                 return Evidence(state: "idle", date: date)
             }
+            if event == "message", payload["role"] as? String == "user" {
+                return Evidence(state: "working", date: date, clearsWaiting: true)
+            }
             if ["function_call", "custom_tool_call"].contains(event) {
                 let name = payload["name"] as? String ?? ""
-                return Evidence(state: name.contains("request_user_input") ? "waiting" : "working", date: date)
+                return Evidence(state: ["request_user_input", "request_user_input_async"].contains(shortTool(name)) ? "waiting" : "working", date: date)
             }
             if ["function_call_output", "custom_tool_call_output"].contains(event) { return Evidence(state: "working", date: date) }
         }
         return nil
+    }
+
+    static func shortTool(_ name: String) -> String {
+        (name.components(separatedBy: ".").last ?? name).components(separatedBy: "__").last ?? name
+    }
+
+    static func questionReplies(_ text: String) -> [String: Set<Int>]? {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let start = "<send_user_message_question_reply>"
+        let end = "</send_user_message_question_reply>"
+        guard text.hasPrefix(start) else { return nil }
+        var body = String(text.dropFirst(start.count))
+        if body.hasSuffix(end) { body = String(body.dropLast(end.count)) }
+        guard let rows = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [[String: Any]] else { return [:] }
+        var replies: [String: Set<Int>] = [:]
+        for row in rows {
+            guard let item = row["questionItemId"] as? String,
+                  let identity = (try? JSONSerialization.jsonObject(with: Data(item.utf8))) as? [Any], identity.count == 3,
+                  let tool = identity[0] as? String, shortTool(tool) == "request_user_input_async",
+                  let call = identity[1] as? String, let index = identity[2] as? NSNumber,
+                  !["c", "d", "f"].contains(String(cString: index.objCType)), index.intValue >= 0 else { continue }
+            replies[call, default: []].insert(index.intValue)
+        }
+        return replies
+    }
+
+    static func deliveryRejected(_ value: Any?) -> Bool {
+        let response: Any?
+        if let text = value as? String {
+            response = try? JSONSerialization.jsonObject(with: Data(text.utf8))
+        } else {
+            response = value
+        }
+        guard let object = response as? [String: Any], let flag = object["accepted"] as? NSNumber,
+              String(cString: flag.objCType) == "c" else { return false }
+        return !flag.boolValue
+    }
+
+    static func codexEvidence(_ rows: [[String: Any]]) -> Evidence? {
+        var pending: [String: Set<Int>] = [:]
+        var asynchronous = Set<String>()
+        var result: Evidence?
+        var resolved = false
+        for row in rows {
+            guard let current = parse(row, agent: "codex"), let payload = row["payload"] as? [String: Any] else { continue }
+            let event = payload["type"] as? String ?? ""
+            let type = row["type"] as? String ?? ""
+            let call = payload["call_id"] as? String ?? "missing_call_id"
+            if current.state == "idle" || (type == "event_msg" && event == "task_started") {
+                pending.removeAll()
+                asynchronous.removeAll()
+                resolved = false
+            }
+            var prompt: String?
+            if type == "response_item", event == "message", payload["role"] as? String == "user" {
+                let blocks = payload["content"] as? [[String: Any]] ?? []
+                prompt = blocks.compactMap { $0["text"] as? String }.joined()
+            } else if type == "event_msg", event == "user_message" {
+                prompt = payload["message"] as? String
+            }
+            if let prompt {
+                if let replies = questionReplies(prompt) {
+                    for (identity, indices) in replies {
+                        guard let unanswered = pending[identity] else { continue }
+                        let remaining = unanswered.subtracting(indices)
+                        if remaining.isEmpty {
+                            pending.removeValue(forKey: identity)
+                            asynchronous.remove(identity)
+                            resolved = true
+                        } else {
+                            pending[identity] = remaining
+                        }
+                    }
+                } else {
+                    pending.removeAll()
+                    asynchronous.removeAll()
+                    resolved = true
+                }
+            }
+            if type == "response_item", ["function_call", "custom_tool_call"].contains(event), current.state == "waiting" {
+                let tool = shortTool(payload["name"] as? String ?? "")
+                let raw = payload["arguments"] as? String ?? payload["input"] as? String ?? "{}"
+                let input = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any]
+                let count = max(1, (input?["questions"] as? [Any])?.count ?? 1)
+                pending[call] = Set(0..<count)
+                if tool == "request_user_input_async" { asynchronous.insert(call) }
+                resolved = false
+            }
+            if type == "response_item", ["function_call_output", "custom_tool_call_output"].contains(event),
+               (!asynchronous.contains(call) || deliveryRejected(payload["output"])), pending.removeValue(forKey: call) != nil {
+                asynchronous.remove(call)
+                resolved = true
+            }
+            result = Evidence(state: pending.isEmpty ? current.state : "waiting", date: current.date,
+                              clearsWaiting: resolved && pending.isEmpty)
+        }
+        return result
     }
 
     static func read(_ url: URL, agent: String) -> Evidence? {
@@ -63,6 +164,10 @@ enum SessionEvidence {
         var lines = data.split(separator: 10, omittingEmptySubsequences: false)
         if offset > 0, !lines.isEmpty { lines.removeFirst() }
         if data.last != 10, !lines.isEmpty { lines.removeLast() }
+        if agent == "codex" {
+            let rows = lines.compactMap { (try? JSONSerialization.jsonObject(with: Data($0))) as? [String: Any] }
+            return codexEvidence(rows)
+        }
         for line in lines.reversed() {
             guard let row = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any] else { continue }
             if let evidence = parse(row, agent: agent) { return evidence }
@@ -83,6 +188,9 @@ final class EvidenceReader: @unchecked Sendable {
 
     func refreshIndex(now: Date = Date()) {
         guard now.timeIntervalSince(scannedAt) > 30 else { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        Diagnostics.emit("evidence.index_start")
+        defer { Diagnostics.emit("evidence.index_end", fields: ["elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000, "row_count": paths.count]) }
         scannedAt = now
         let codex = ProcessInfo.processInfo.environment["CODEX_HOME"].map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent(".codex")
         if let text = try? String(contentsOf: codex.appendingPathComponent("session_index.jsonl"), encoding: .utf8) {
@@ -107,9 +215,16 @@ final class EvidenceReader: @unchecked Sendable {
     func evidence(agent: String, id: String) -> Evidence? {
         let key = "\(agent)-\(id)"
         guard let url = paths[key], let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let modified = attributes[.modificationDate] as? Date, let size = attributes[.size] as? Int else { return nil }
+              let modified = attributes[.modificationDate] as? Date, let size = attributes[.size] as? Int else {
+            Diagnostics.emit("evidence.missing", agent: agent, fields: ["session_id": id])
+            return nil
+        }
         if let previous = cache[key], previous.0 == modified && previous.1 == size { return previous.2 }
+        let started = ProcessInfo.processInfo.systemUptime
         let result = SessionEvidence.read(url, agent: agent)
+        var fields: [String: Any] = ["session_id": id, "elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000]
+        if let result { fields["evidence_state"] = result.state; fields["evidence_ms"] = result.date.timeIntervalSince1970 * 1000 }
+        Diagnostics.emit("evidence.read", agent: agent, fields: fields)
         cache[key] = (modified, size, result)
         return result
     }
@@ -134,11 +249,26 @@ enum Reconcile {
 
     static func state(_ original: SessionStatus, place: TerminalPlace?, evidence: Evidence?, now: Date) -> SessionStatus {
         var result = original
+        var reason = "hook_retained"
+        defer {
+            var fields: [String: Any] = ["session_id": original.sessionId, "hook_state": original.state,
+                                       "state": result.state, "reason": reason]
+            if let id = original.ghosttyTerminalId { fields["terminal_id"] = id }
+            if let date = timestamp(original.updatedAt) { fields["reported_ms"] = date.timeIntervalSince1970 * 1000 }
+            if let evidence {
+                fields["evidence_state"] = evidence.state
+                fields["evidence_ms"] = evidence.date.timeIntervalSince1970 * 1000
+            }
+            Diagnostics.emit("sidebar.reconcile", agent: original.agent, fields: fields)
+        }
         guard original.state != "done" else { return result }
         let reported = timestamp(original.updatedAt) ?? .distantPast
         if let evidence {
-            if evidence.date > reported.addingTimeInterval(1), evidence.state != original.state {
+            let unresolvedQuestion = original.agent == "codex" && original.state == "waiting"
+                && evidence.state == "working" && !evidence.clearsWaiting
+            if evidence.date > reported.addingTimeInterval(1), evidence.state != original.state, !unresolvedQuestion {
                 result.state = evidence.state
+                reason = "newer_evidence"
                 result.message = evidence.state == "waiting" ? "Question awaiting an answer" : nil
             }
             // A hook that lost the lock race to Stop can leave a finished turn on working.
@@ -146,11 +276,13 @@ enum Reconcile {
                now.timeIntervalSince(evidence.date) > 3, now.timeIntervalSince(reported) > 3,
                place.flatMap({ claudeActivity($0.title) }) == "idle" {
                 result.state = "idle"
+                reason = "finished_turn_title"
                 result.message = nil
             }
         } else if now.timeIntervalSince(reported) > 15, original.state == "working",
                   original.agent == "claude", place.flatMap({ claudeActivity($0.title) }) == "idle" {
             result.state = "idle"
+            reason = "idle_title_fallback"
             result.message = "Idle in terminal"
         }
         return result
