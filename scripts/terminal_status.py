@@ -72,7 +72,7 @@ INPUT_WINDOW_SECONDS = 10
 LOCK_WAIT_SECONDS = 2.0
 MESSAGE_MAX = 120
 PRUNE_AFTER_SECONDS = 24 * 3600
-# A probe that misses holds the shared title-probe lock for up to ~35 s, so one is not retried on every hook event.
+# A probe that misses holds the shared title-probe lock for seconds (~35 s on the slow listing), so it is not retried on every event.
 PROBE_BACKOFF_SECONDS = 300
 
 
@@ -787,9 +787,14 @@ def _apply(agent: str, session_id: str, event: str) -> None:
         # Codex redraws its spinner title faster than a tty probe can be read back, so its own title goes first.
         terminal_id = codex_terminal_by_name(session_id) if agent == "codex" else None
         missed = probe_miss_path(agent, session_id)
-        if not terminal_id and tty and not _modified_within(missed, PROBE_BACKOFF_SECONDS):
-            terminal_id = ghostty_tabs.terminals_for_ttys(
-                [tty], cached=lambda: read_status(agent, session_id).get("ghostty_terminal_id")).get(tty)
+        # A finished turn stops the agent's spinner, the one point a probe title reliably stays put.
+        if not terminal_id and tty and (event == "Stop" or not _modified_within(missed, PROBE_BACKOFF_SECONDS)):
+            def resolved_meanwhile() -> str | None:
+                if found := read_status(agent, session_id).get("ghostty_terminal_id"):
+                    return found
+                return "" if event != "Stop" and _modified_within(missed, PROBE_BACKOFF_SECONDS) else None
+
+            terminal_id = ghostty_tabs.terminals_for_ttys([tty], cached=resolved_meanwhile).get(tty)
             if not terminal_id:
                 missed.parent.mkdir(parents=True, exist_ok=True)
                 missed.touch()

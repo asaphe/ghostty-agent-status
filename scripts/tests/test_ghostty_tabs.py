@@ -71,6 +71,11 @@ class TtyProbeTests(unittest.TestCase):
             self.assertEqual(g.terminals_for_ttys(["/dev/ttys001"], cached=lambda: "T1"), {"/dev/ttys001": "T1"})
         probe.assert_not_called()
 
+    def test_a_probe_that_just_missed_while_waiting_is_not_repeated(self):
+        with patch.object(g, "_probe_ttys") as probe:
+            self.assertEqual(g.terminals_for_ttys(["/dev/ttys001"], cached=lambda: ""), {})
+        probe.assert_not_called()
+
     def test_an_unresolved_cache_still_probes(self):
         with patch.object(g, "_probe_ttys", return_value={"/dev/ttys001": "T1"}) as probe:
             self.assertEqual(g.terminals_for_ttys(["/dev/ttys001"], cached=lambda: None), {"/dev/ttys001": "T1"})

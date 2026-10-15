@@ -298,7 +298,8 @@ def terminals_for_ttys(ttys: list[str], cached: Callable[[], str | None] | None 
     """Serialize title probes so concurrent callers never save another caller's nonce as a title.
 
     CACHED, asked once the lock is held, returns a terminal another caller resolved while this one
-    waited; a single tty then maps to it without a second probe.
+    waited, "" when another caller's probe of it just missed, or None to probe; a single tty then
+    skips a second probe.
     """
     if not ttys:
         return {}
@@ -320,9 +321,9 @@ def terminals_for_ttys(ttys: list[str], cached: Callable[[], str | None] | None 
                 time.sleep(0.05)
         if cached is not None and len(set(ttys)) == 1:
             terminal_id = cached()
-            if terminal_id:
-                diagnostics.emit("probe.skipped", reason="resolved_while_waiting")
-                return {ttys[0]: terminal_id}
+            if terminal_id is not None:
+                diagnostics.emit("probe.skipped", reason="resolved_while_waiting" if terminal_id else "missed_while_waiting")
+                return {ttys[0]: terminal_id} if terminal_id else {}
         return _probe_ttys(ttys)
 
 

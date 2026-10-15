@@ -598,6 +598,41 @@ class StatusFileTests(unittest.TestCase):
             s.apply("codex", "sid-1", "PreToolUse")
         self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
 
+    def test_a_finished_turn_probes_again_inside_the_backoff(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={}):
+            s.apply("codex", "sid-1", "UserPromptSubmit")
+        self.assertTrue(s._modified_within(s.probe_miss_path("codex", "sid-1"), s.PROBE_BACKOFF_SECONDS))
+        with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                patch.object(s.ghostty_tabs, "terminals_for_ttys", return_value={"/dev/ttys042": "T9"}), \
+                patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
+            s.apply("codex", "sid-1", "Stop")
+        self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], "T9")
+
+    def test_a_worker_that_waited_out_another_probe_miss_probes_again_only_after_a_turn(self):
+        self.run_hook("UserPromptSubmit")
+        record = s.read_status("claude", "sid-1")
+        record["agent"] = "codex"
+        s.write_status(record)
+
+        def probe(ttys, cached):
+            missed = s.probe_miss_path("codex", "sid-1")
+            missed.parent.mkdir(parents=True, exist_ok=True)
+            missed.touch()
+            return {} if cached() == "" else {"/dev/ttys042": "T9"}
+
+        for event, expected in (("PreToolUse", None), ("Stop", "T9")):
+            s.probe_miss_path("codex", "sid-1").unlink(missing_ok=True)
+            with patch.object(s, "locate", return_value=(4242, "/dev/ttys042")), \
+                    patch.object(s.ghostty_tabs, "terminals_for_ttys", side_effect=probe), \
+                    patch.object(s.ghostty_tabs, "find", return_value=None), patch.object(s, "show"):
+                s.apply("codex", "sid-1", event)
+            self.assertEqual(s.read_status("codex", "sid-1")["ghostty_terminal_id"], expected, event)
+
     def test_recorded_terminal_is_this_session_only_while_its_process_owns_the_record(self):
         s.write_status({"agent": "claude", "session_id": "sid-1", "pid": 4242, "ghostty_terminal_id": "T7"})
         for env, expected in (({"CLAUDE_CODE_SESSION_ID": "sid-1", "CLAUDE_PID": "4242"}, "T7"),
