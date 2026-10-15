@@ -95,6 +95,8 @@ python3 scripts/terminal_status.py label <ghostty-terminal-id> "Release prep" "t
 
 ## Development
 
+For delayed or incorrect icons, use the opt-in [diagnostic capture workflow](DIAGNOSTICS.md) to trace Claude and Codex separately before changing state logic.
+
 ```bash
 /usr/bin/python3 -m unittest discover -s scripts/tests
 bash app/test.sh
