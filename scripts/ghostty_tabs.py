@@ -104,6 +104,8 @@ end run
 
 # Reads each property for every terminal in one Apple event instead of one event per terminal.
 LAYOUT_CHANGED = "layout-changed"
+# The per-terminal fallback is slower and fails outright when a tab closes mid-loop, so the bulk query is retried first.
+LAYOUT_ATTEMPTS = 3
 BULK_LIST_SCRIPT = """
 on run argv
   set fs to character id 31
@@ -141,8 +143,12 @@ end run
 def terminals() -> list[Terminal]:
     started = time.monotonic()
     found = []
-    out = osascript(BULK_LIST_SCRIPT)
-    if out == LAYOUT_CHANGED:
+    for _ in range(LAYOUT_ATTEMPTS):
+        out = osascript(BULK_LIST_SCRIPT)
+        if out != LAYOUT_CHANGED:
+            break
+        diagnostics.emit("ghostty.list_retry", reason="layout_changed")
+    else:
         diagnostics.emit("ghostty.list_fallback", reason="layout_changed")
         out = osascript(LIST_SCRIPT)
     for row in out.split(ROW):

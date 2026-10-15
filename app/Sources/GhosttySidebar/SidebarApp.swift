@@ -171,13 +171,15 @@ enum Ghostty {
         let started = ProcessInfo.processInfo.systemUptime
         Diagnostics.emit("sidebar.ghostty_start")
         defer { Diagnostics.emit("sidebar.ghostty_end", fields: ["elapsed_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000]) }
-        guard var text = runScript(bulkTabLayoutScript) else { return nil }
-        if text.trimmingCharacters(in: .whitespacesAndNewlines) == layoutChanged {
-            Diagnostics.emit("sidebar.ghostty_fallback", fields: ["reason": "layout_changed"])
-            guard let fallback = runScript(tabLayoutScript) else { return nil }
-            text = fallback
+        // The per-terminal fallback is slower and fails outright when a tab closes mid-loop, so the bulk query is retried first.
+        for _ in 0..<3 {
+            guard let text = runScript(bulkTabLayoutScript) else { return nil }
+            if text.trimmingCharacters(in: .whitespacesAndNewlines) != layoutChanged { return parseLayout(text) }
+            Diagnostics.emit("sidebar.ghostty_retry", fields: ["reason": "layout_changed"])
         }
-        return parseLayout(text)
+        Diagnostics.emit("sidebar.ghostty_fallback", fields: ["reason": "layout_changed"])
+        guard let fallback = runScript(tabLayoutScript) else { return nil }
+        return parseLayout(fallback)
     }
 
     static func runScript(_ script: String) -> String? {

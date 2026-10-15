@@ -27,11 +27,18 @@ class ListingTests(unittest.TestCase):
             self.assertEqual([t.id for t in g.terminals()], ["T1"])
         self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT])
 
-    def test_a_layout_change_during_the_bulk_query_falls_back_to_the_per_terminal_listing(self):
+    def test_a_layout_change_during_the_bulk_query_retries_it(self):
         raw = g.FIELD.join(["T1", "tab1", "w1", "zsh", "zsh", "/", "false"]) + g.ROW
         with patch.object(g, "osascript", side_effect=[g.LAYOUT_CHANGED, raw]) as call:
             self.assertEqual([t.id for t in g.terminals()], ["T1"])
-        self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT, g.LIST_SCRIPT])
+        self.assertEqual([c.args[0] for c in call.call_args_list], [g.BULK_LIST_SCRIPT, g.BULK_LIST_SCRIPT])
+
+    def test_a_layout_that_keeps_changing_falls_back_to_the_per_terminal_listing(self):
+        raw = g.FIELD.join(["T1", "tab1", "w1", "zsh", "zsh", "/", "false"]) + g.ROW
+        with patch.object(g, "osascript", side_effect=[g.LAYOUT_CHANGED] * g.LAYOUT_ATTEMPTS + [raw]) as call:
+            self.assertEqual([t.id for t in g.terminals()], ["T1"])
+        self.assertEqual([c.args[0] for c in call.call_args_list],
+                         [g.BULK_LIST_SCRIPT] * g.LAYOUT_ATTEMPTS + [g.LIST_SCRIPT])
 
 
 class TtyProbeTests(unittest.TestCase):
